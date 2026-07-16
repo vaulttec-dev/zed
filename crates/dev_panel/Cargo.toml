@@ -14,12 +14,14 @@ path = "src/dev_panel.rs"
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+db.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
 project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_json_lenient.workspace = true
 serde_yaml.workspace = true
 smol.workspace = true
 task.workspace = true
