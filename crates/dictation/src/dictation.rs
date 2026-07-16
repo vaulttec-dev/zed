@@ -8,6 +8,16 @@
 //! Ported from the TypeScript dictation feature in the `dev-environment-manager`
 //! VS Code extension (`plugin/src/workflows/dictation/*`).
 
+// This crate is deliberately GPUI-free (see module docs above), so the
+// executor-based timer clippy suggests as the replacement is unavailable here.
+// The `smol::Timer::after` calls below are real wall-clock timeouts on
+// production paths (ffmpeg lifecycle, request timeout, retry backoff), not test
+// timing, so the non-determinism concern does not apply.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "GPUI-free crate: gpui executor timer is unavailable; timers are production wall-clock timeouts"
+)]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

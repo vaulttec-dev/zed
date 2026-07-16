@@ -152,7 +152,7 @@ impl DevPanel {
                 .read(cx)
                 .visible_worktrees(cx)
                 .next()
-                .map(|wt| wt.read(cx).abs_path().clone());
+                .map(|wt| wt.read(cx).abs_path());
             let mut panel = Self {
                 workspace: weak,
                 project,
@@ -961,8 +961,7 @@ fn override_key(workspace: &Workspace, cx: &App) -> Option<String> {
         .visible_worktrees(cx)
         .next()?
         .read(cx)
-        .abs_path()
-        .clone();
+        .abs_path();
     Some(format!("dev_panel::overrides::{}", root.display()))
 }
 
