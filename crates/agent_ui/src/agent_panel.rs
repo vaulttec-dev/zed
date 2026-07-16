@@ -91,8 +91,9 @@ use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -1186,6 +1187,10 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+    /// In-flight voice dictation recording for the agent-panel terminal.
+    dictation: Option<dictation::Recording>,
+    /// True while a recording is being transcribed (shows a spinner).
+    dictation_transcribing: bool,
 }
 
 impl AgentPanel {
@@ -1589,6 +1594,8 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
+            dictation: None,
+            dictation_transcribing: false,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -3988,6 +3995,97 @@ impl AgentPanel {
         }
     }
 
+    fn render_terminal_dictation_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.dictation_transcribing {
+            return Icon::new(IconName::LoadCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_rotate_animation(2)
+                .into_any_element();
+        }
+        let recording = self.dictation.is_some();
+        let (icon, tip, color) = if recording {
+            (IconName::Stop, "Stop dictation & insert", Color::Error)
+        } else {
+            (IconName::Mic, "Voice dictation", Color::Muted)
+        };
+        IconButton::new("terminal-thread-dictation", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tip))
+            .on_click(cx.listener(|this, _, _window, cx| this.toggle_dictation(cx)))
+            .into_any_element()
+    }
+
+    fn toggle_dictation(&mut self, cx: &mut Context<Self>) {
+        if self.dictation.is_some() {
+            self.stop_dictation(cx);
+        } else {
+            self.start_dictation(cx);
+        }
+    }
+
+    fn start_dictation(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            match dictation::start_recording().await {
+                Ok(recording) => {
+                    this.update(cx, |this, cx| {
+                        this.dictation = Some(recording);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    log::error!("dictation: failed to start recording: {err:#}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_dictation(&mut self, cx: &mut Context<Self>) {
+        let Some(recording) = self.dictation.take() else {
+            return;
+        };
+        // Show the spinner while transcription runs in the background.
+        self.dictation_transcribing = true;
+        cx.notify();
+
+        let http = self.project.read(cx).client().http_client();
+        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
+
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<String> = async {
+                let wav = dictation::stop_recording(recording).await?;
+                let text = dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
+                dictation::cleanup(&wav);
+                text
+            }
+            .await;
+
+            this.update(cx, |this, cx| {
+                this.dictation_transcribing = false;
+                match result {
+                    Ok(text) => {
+                        if let Some(terminal_view) = this.visible_terminal_view().cloned() {
+                            let terminal = terminal_view.read(cx).terminal().clone();
+                            terminal.update(cx, |terminal, _| {
+                                terminal.input(text.into_bytes());
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("dictation: {err:#}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn toggle_terminal_thread_search(
         &mut self,
         _: &crate::ToggleSearch,
@@ -6132,6 +6230,9 @@ impl AgentPanel {
                         .gap_1()
                         .children(sandbox_status)
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .when(showing_terminal, |this| {
+                            this.child(self.render_terminal_dictation_button(cx))
+                        })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )

@@ -42,8 +42,8 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
-    SplitButtonStyle, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, CommonAnimationExt, SpinnerLabel, SpinnerVariant,
+    SplitButton, SplitButtonStyle, Tab, ToggleState,
 };
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
@@ -643,6 +643,10 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    /// In-flight voice dictation recording (`Some` while the mic is live).
+    dictation: Option<dictation::Recording>,
+    /// True while a recording is being transcribed (shows a spinner).
+    dictation_transcribing: bool,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1041,6 +1045,8 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            dictation: None,
+            dictation_transcribing: false,
         };
 
         this.sync_generating_indicator(cx);
@@ -4357,6 +4363,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_dictation_button(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -4906,6 +4913,102 @@ impl ThreadView {
                 .child(Divider::vertical())
                 .into_any_element(),
         )
+    }
+
+    fn render_dictation_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.dictation_transcribing {
+            return Icon::new(IconName::LoadCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_rotate_animation(2)
+                .into_any_element();
+        }
+        let recording = self.dictation.is_some();
+        let (icon, tip, color) = if recording {
+            (IconName::Stop, "Stop dictation & transcribe", Color::Error)
+        } else {
+            (IconName::Mic, "Voice dictation", Color::Muted)
+        };
+        IconButton::new("thread-dictation", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tip))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)))
+            .into_any_element()
+    }
+
+    fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation.is_some() {
+            self.stop_dictation(window, cx);
+        } else {
+            self.start_dictation(cx);
+        }
+    }
+
+    fn start_dictation(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            match dictation::start_recording().await {
+                Ok(recording) => {
+                    this.update(cx, |this, cx| {
+                        this.dictation = Some(recording);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    log::error!("dictation: failed to start recording: {err:#}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(recording) = self.dictation.take() else {
+            return;
+        };
+
+        let Some(http) = self
+            .workspace
+            .upgrade()
+            .map(|ws| ws.read(cx).client().http_client())
+        else {
+            cx.notify();
+            return;
+        };
+        // Show the spinner while transcription runs in the background.
+        self.dictation_transcribing = true;
+        cx.notify();
+
+        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<String> = async {
+                let wav = dictation::stop_recording(recording).await?;
+                let text = dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
+                dictation::cleanup(&wav);
+                text
+            }
+            .await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.dictation_transcribing = false;
+                match result {
+                    Ok(text) => {
+                        this.message_editor.update(cx, |editor, cx| {
+                            editor.insert_text(&text, window, cx);
+                        });
+                    }
+                    Err(err) => {
+                        log::error!("dictation: {err:#}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_fast_mode_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

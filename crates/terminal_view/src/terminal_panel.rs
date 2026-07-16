@@ -22,8 +22,8 @@ use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
 use terminal::{Terminal, terminal_settings::TerminalSettings};
 use ui::{
-    ButtonLike, Clickable, ContextMenu, FluentBuilder, PopoverMenu, SplitButton, Toggleable,
-    Tooltip, prelude::*,
+    ButtonLike, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu, SplitButton,
+    Toggleable, Tooltip, prelude::*,
 };
 use util::{ResultExt, TryFutureExt};
 use workspace::{
@@ -86,6 +86,8 @@ pub struct TerminalPanel {
     active: bool,
     /// In-flight voice dictation recording (`Some` while the mic is live).
     dictation: Option<dictation::Recording>,
+    /// True while a recording is being transcribed (shows a spinner).
+    dictation_transcribing: bool,
 }
 
 impl TerminalPanel {
@@ -104,6 +106,7 @@ impl TerminalPanel {
             assistant_enabled: false,
             active: false,
             dictation: None,
+            dictation_transcribing: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
         terminal_panel
@@ -163,11 +166,14 @@ impl TerminalPanel {
         let Some(recording) = self.dictation.take() else {
             return;
         };
-        // Flip the icon back to "mic" immediately; transcription runs in the bg.
+        // Show the spinner while transcription runs in the background.
+        self.dictation_transcribing = true;
         self.refresh_dictation_buttons(cx);
 
         let workspace = self.workspace.clone();
         let Some(http) = workspace.upgrade().map(|ws| ws.read(cx).client().http_client()) else {
+            self.dictation_transcribing = false;
+            self.refresh_dictation_buttons(cx);
             return;
         };
         let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
@@ -189,12 +195,20 @@ impl TerminalPanel {
                 Ok(text) => {
                     panel
                         .update_in(cx, |panel, window, cx| {
+                            panel.dictation_transcribing = false;
                             panel.insert_into_active_terminal(text, window, cx);
+                            panel.refresh_dictation_buttons(cx);
                         })
                         .ok();
                 }
                 Err(err) => {
                     log::error!("dictation: {err:#}");
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.dictation_transcribing = false;
+                            panel.refresh_dictation_buttons(cx);
+                        })
+                        .ok();
                     workspace
                         .update(cx, |ws, cx| {
                             ws.show_error(format!("Voice dictation: {err}"), cx)
@@ -235,6 +249,7 @@ impl TerminalPanel {
         let assistant_enabled = self.assistant_enabled;
         let dictation_panel = cx.weak_entity();
         let dictation_recording = self.dictation.is_some();
+        let dictation_transcribing = self.dictation_transcribing;
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -284,24 +299,35 @@ impl TerminalPanel {
                     )
                     .child({
                         let dictation_panel = dictation_panel.clone();
-                        let icon = if dictation_recording {
-                            IconName::Stop
+                        if dictation_transcribing {
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2)
+                                .into_any_element()
                         } else {
-                            IconName::Mic
-                        };
-                        IconButton::new("terminal-dictation", icon)
-                            .icon_size(IconSize::Small)
-                            .toggle_state(dictation_recording)
-                            .on_click(move |_, window, cx| {
-                                if let Some(panel) = dictation_panel.upgrade() {
-                                    panel.update(cx, |panel, cx| panel.toggle_dictation(window, cx));
-                                }
-                            })
-                            .tooltip(Tooltip::text(if dictation_recording {
-                                "Stop dictation & transcribe"
+                            let icon = if dictation_recording {
+                                IconName::Stop
                             } else {
-                                "Start voice dictation"
-                            }))
+                                IconName::Mic
+                            };
+                            IconButton::new("terminal-dictation", icon)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(dictation_recording)
+                                .on_click(move |_, window, cx| {
+                                    if let Some(panel) = dictation_panel.upgrade() {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.toggle_dictation(window, cx)
+                                        });
+                                    }
+                                })
+                                .tooltip(Tooltip::text(if dictation_recording {
+                                    "Stop dictation & transcribe"
+                                } else {
+                                    "Start voice dictation"
+                                }))
+                                .into_any_element()
+                        }
                     })
                     .when(assistant_enabled, |this| {
                         this.when_some(split_context.clone(), |this, focus_handle| {

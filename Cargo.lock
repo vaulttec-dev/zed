@@ -479,6 +479,7 @@ dependencies = [
  "component",
  "context_server",
  "db",
+ "dictation",
  "editor",
  "eval_utils",
  "extension",
