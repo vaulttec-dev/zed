@@ -92,6 +92,37 @@ impl State {
             cx,
         )
     }
+
+    fn current_key(&self, cx: &App) -> Option<Arc<str>> {
+        self.api_key_state
+            .key(&GoogleLanguageModelProvider::api_url(cx))
+    }
+}
+
+/// Holds the Google provider's authentication state so that other features
+/// (e.g. voice dictation) can reuse the same Gemini API key the user configured
+/// under the Google language model provider, instead of relying on a separate
+/// `GEMINI_API_KEY` environment variable.
+struct GlobalGoogleState(Entity<State>);
+
+impl gpui::Global for GlobalGoogleState {}
+
+/// Returns the Gemini API key configured for the Google language model provider,
+/// loading it from an environment variable or the system keychain if needed.
+///
+/// This is the single source of truth for the Gemini key across the app.
+pub fn google_api_key(cx: &mut App) -> Task<Option<Arc<str>>> {
+    let Some(state) = cx
+        .try_global::<GlobalGoogleState>()
+        .map(|global| global.0.clone())
+    else {
+        return Task::ready(None);
+    };
+    let load = state.update(cx, |state, cx| state.authenticate(cx));
+    cx.spawn(async move |cx| {
+        load.await.ok();
+        cx.update(|cx| state.read(cx).current_key(cx))
+    })
 }
 
 impl GoogleLanguageModelProvider {
@@ -118,6 +149,8 @@ impl GoogleLanguageModelProvider {
                 credentials_provider,
             }
         });
+
+        cx.set_global(GlobalGoogleState(state.clone()));
 
         Self { http_client, state }
     }

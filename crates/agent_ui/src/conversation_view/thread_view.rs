@@ -4980,12 +4980,13 @@ impl ThreadView {
         self.dictation_transcribing = true;
         cx.notify();
 
-        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        let api_key_task = language_models::google_api_key(cx);
         let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
 
         cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<String> = async {
                 let wav = dictation::stop_recording(recording).await?;
+                let api_key = api_key_task.await.map(|key| key.to_string()).unwrap_or_default();
                 let text = dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
                 dictation::cleanup(&wav);
                 text
