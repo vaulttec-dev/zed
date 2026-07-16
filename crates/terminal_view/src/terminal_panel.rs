@@ -1,7 +1,7 @@
 use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 
 use crate::{
-    TerminalView, default_working_directory,
+    SendText, TerminalView, default_working_directory,
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
@@ -84,6 +84,8 @@ pub struct TerminalPanel {
     deferred_tasks: HashMap<TaskId, Task<()>>,
     assistant_enabled: bool,
     active: bool,
+    /// In-flight voice dictation recording (`Some` while the mic is live).
+    dictation: Option<dictation::Recording>,
 }
 
 impl TerminalPanel {
@@ -101,6 +103,7 @@ impl TerminalPanel {
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
             active: false,
+            dictation: None,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
         terminal_panel
@@ -113,12 +116,125 @@ impl TerminalPanel {
         }
     }
 
+    /// Re-render every pane's tab bar so the dictation button reflects the
+    /// current recording state (mic ↔ stop icon).
+    fn refresh_dictation_buttons(&self, cx: &mut Context<Self>) {
+        for pane in self.center.panes() {
+            self.apply_tab_bar_buttons(pane, cx);
+        }
+    }
+
+    /// Toggle voice dictation: first click starts recording, second click stops,
+    /// transcribes with Gemini, and inserts the text into the active terminal.
+    fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation.is_some() {
+            self.stop_dictation(window, cx);
+        } else {
+            self.start_dictation(window, cx);
+        }
+    }
+
+    fn start_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |panel, cx| {
+            match dictation::start_recording().await {
+                Ok(recording) => {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.dictation = Some(recording);
+                            panel.refresh_dictation_buttons(cx);
+                        })
+                        .ok();
+                }
+                Err(err) => {
+                    log::error!("dictation: failed to start recording: {err:#}");
+                    workspace
+                        .update(cx, |ws, cx| {
+                            ws.show_error(format!("Voice dictation: {err}"), cx)
+                        })
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn stop_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(recording) = self.dictation.take() else {
+            return;
+        };
+        // Flip the icon back to "mic" immediately; transcription runs in the bg.
+        self.refresh_dictation_buttons(cx);
+
+        let workspace = self.workspace.clone();
+        let Some(http) = workspace.upgrade().map(|ws| ws.read(cx).client().http_client()) else {
+            return;
+        };
+        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+        // Default to Ukrainian for accurate recognition; override with
+        // ZED_DICTATION_LANG (e.g. "en", "de", or "auto" to let Gemini detect).
+        let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
+
+        cx.spawn_in(window, async move |panel, cx| {
+            let result: Result<String> = async {
+                let wav = dictation::stop_recording(recording).await?;
+                let text =
+                    dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
+                dictation::cleanup(&wav);
+                text
+            }
+            .await;
+
+            match result {
+                Ok(text) => {
+                    panel
+                        .update_in(cx, |panel, window, cx| {
+                            panel.insert_into_active_terminal(text, window, cx);
+                        })
+                        .ok();
+                }
+                Err(err) => {
+                    log::error!("dictation: {err:#}");
+                    workspace
+                        .update(cx, |ws, cx| {
+                            ws.show_error(format!("Voice dictation: {err}"), cx)
+                        })
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Insert transcribed text into the active terminal via the existing
+    /// `terminal::SendText` action (same path as a manual keybinding).
+    fn insert_into_active_terminal(
+        &self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal_view) = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<TerminalView>())
+        else {
+            log::warn!("dictation: no active terminal to insert transcription into");
+            return;
+        };
+        let focus_handle = terminal_view.read(cx).focus_handle.clone();
+        focus_handle.dispatch_action(&SendText(text), window, cx);
+    }
+
     pub(crate) fn apply_tab_bar_buttons(
         &self,
         terminal_pane: &Entity<Pane>,
         cx: &mut Context<Self>,
     ) {
         let assistant_enabled = self.assistant_enabled;
+        let dictation_panel = cx.weak_entity();
+        let dictation_recording = self.dictation.is_some();
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -166,6 +282,27 @@ impl TerminalPanel {
                                 Some(menu)
                             }),
                     )
+                    .child({
+                        let dictation_panel = dictation_panel.clone();
+                        let icon = if dictation_recording {
+                            IconName::Stop
+                        } else {
+                            IconName::Mic
+                        };
+                        IconButton::new("terminal-dictation", icon)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(dictation_recording)
+                            .on_click(move |_, window, cx| {
+                                if let Some(panel) = dictation_panel.upgrade() {
+                                    panel.update(cx, |panel, cx| panel.toggle_dictation(window, cx));
+                                }
+                            })
+                            .tooltip(Tooltip::text(if dictation_recording {
+                                "Stop dictation & transcribe"
+                            } else {
+                                "Start voice dictation"
+                            }))
+                    })
                     .when(assistant_enabled, |this| {
                         this.when_some(split_context.clone(), |this, focus_handle| {
                             this.child(InlineAssistTabBarButton { focus_handle })

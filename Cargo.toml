@@ -54,6 +54,7 @@ members = [
     "crates/deepseek",
     "crates/dev_container",
     "crates/diagnostics",
+    "crates/dictation",
     "crates/docs_preprocessor",
     "crates/edit_prediction",
     "crates/edit_prediction_cli",
@@ -325,6 +326,7 @@ deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
+dictation = { path = "crates/dictation" }
 dialoguer = { version = "0.12", default-features = false }
 editor = { path = "crates/editor" }
 encoding_selector = { path = "crates/encoding_selector" }

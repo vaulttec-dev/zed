@@ -5249,6 +5249,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dictation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-fs",
+ "futures 0.3.32",
+ "http_client",
+ "log",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "util",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18486,6 +18502,7 @@ dependencies = [
  "breadcrumbs",
  "collections",
  "db",
+ "dictation",
  "dirs",
  "editor",
  "futures 0.3.32",
