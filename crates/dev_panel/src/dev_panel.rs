@@ -1,35 +1,44 @@
 //! Dev Panel — a left-dock panel that auto-detects a project's runnable tasks
-//! (dev servers and one-shot workflows) and Docker services, and lets you
+//! (dev servers and one-shot scripts) and Docker services, and lets you
 //! start/stop them with one click.
 //!
-//! Detection is universal and file-native — it reads whatever the project
-//! already has, across stacks:
-//! - `package.json` scripts (Node)
-//! - `Makefile` targets (any language)
-//! - `Procfile` process entries (always servers)
+//! Detection is file-native and tree-wide: it walks every visible worktree
+//! (respecting `.gitignore`) and reads whatever manifests the project already
+//! has, in any subdirectory, across stacks:
+//! - `package.json` scripts (Node, per package — monorepos included)
+//! - `Cargo.toml` (`cargo run`, one per `[[bin]]`)
+//! - Go `main` packages (`go run .`)
+//! - `pyproject.toml` scripts, Django `manage.py`, bare `main.py`/`app.py`
+//! - `Makefile` targets, `justfile` recipes, `Taskfile.yml` tasks
+//! - `Procfile`/`Procfile.*` process entries (always servers)
+//! - `composer.json` scripts (PHP), `*.csproj`/`*.fsproj` (.NET)
 //! - `.zed/tasks.json` native Zed tasks
-//! - `Cargo.toml` (`cargo run`)
-//! - `docker-compose` services (containers), with live status from `docker
-//!   compose ps`
+//! - `docker-compose`/`compose` services (containers), with live status from
+//!   `docker compose ps`
 //!
-//! Each runnable gets a heuristic **Server / Workflow** category that you can
-//! override per row; the choice is remembered per project in Zed's local DB
-//! (no file in the repo). Everything runs in Zed's own terminal panel.
+//! The list refreshes itself: it rescans (debounced) whenever the project's
+//! files change, so there is no manual refresh. Each runnable is classified as
+//! **Server** or **Script** automatically (see [`classification`]). For the rare
+//! genuine miss, the escape hatch is declarative and checked-in: tag a task in
+//! `.zed/tasks.json` with `dev:server` or `dev:script`. Everything runs in Zed's
+//! own terminal panel.
 
-use std::path::Path;
+mod classification;
+mod detection;
+mod parsers;
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use collections::{HashMap, HashSet};
-use db::kvp::KeyValueStore;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, WeakEntity, Window,
-    actions, px,
+    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Task, WeakEntity,
+    Window, actions, px,
 };
 use project::Project;
-use serde::{Deserialize, Serialize};
 use task::{RevealStrategy, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::terminal_panel::TerminalPanel;
@@ -39,6 +48,13 @@ use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
+
+use classification::Category;
+use detection::{
+    Candidate, Container, MAX_MANIFEST_DEPTH, Runnable, SKIP_DIRS, ScanIndex, candidate_kind,
+    scan_candidates,
+};
+use parsers::parse_running_services;
 
 actions!(
     dev_panel,
@@ -58,53 +74,28 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// Whether a runnable is a long-running server or a one-shot workflow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Category {
-    Server,
-    Workflow,
-}
-
-impl Category {
-    fn opposite(self) -> Self {
-        match self {
-            Category::Server => Category::Workflow,
-            Category::Workflow => Category::Server,
-        }
-    }
-}
-
-/// A detected runnable command from any source.
-#[derive(Clone)]
-struct Runnable {
-    /// Stable unique id, e.g. `npm:dev`, `make:run-dev`, `proc:web`, `zed:clippy`.
-    id: String,
-    /// Display label.
-    label: String,
-    /// Executable to run.
-    program: String,
-    /// Arguments.
-    args: Vec<String>,
-    /// Heuristic category before any user override.
-    default_category: Category,
-}
-
 pub struct DevPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
-    root: Option<Arc<Path>>,
     runnables: Vec<Runnable>,
-    /// Per-runnable category overrides (id → category).
-    overrides: HashMap<String, Category>,
-    /// KV key under which `overrides` persists (per project root).
-    override_key: Option<String>,
-    containers: Vec<String>,
+    containers: Vec<Container>,
+    /// Ids of containers currently reported as running.
     container_running: HashSet<String>,
     /// Live terminals for started servers, keyed by runnable id.
     running: HashMap<String, WeakEntity<Terminal>>,
-    pending_save: Task<()>,
+    /// Ids whose start task is in flight (the terminal handle hasn't resolved
+    /// yet), so a rapid second click can't launch a duplicate.
+    starting: HashSet<String>,
+    /// Coalesces file-change events into a single rescan.
+    debounce_task: Task<()>,
+    /// The in-flight tree scan (cancelled if a newer one starts).
+    scan_task: Task<()>,
+    /// The in-flight container-status probe.
+    status_task: Task<()>,
+    /// The periodic container-status poll.
+    poll_task: Task<()>,
+    _subscriptions: Vec<Subscription>,
     position: DockPosition,
     width: Option<Pixels>,
 }
@@ -114,33 +105,11 @@ impl DevPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        // Load per-project category overrides before building the panel.
-        let override_key = workspace
-            .read_with(&cx, |workspace, cx| override_key(workspace, cx))
-            .ok()
-            .flatten();
-        let overrides = match override_key.clone() {
-            Some(key) => {
-                let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
-                cx.background_spawn(async move { kvp.read_kvp(&key) })
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|s| serde_json::from_str::<HashMap<String, Category>>(&s).ok())
-                    .unwrap_or_default()
-            }
-            None => HashMap::default(),
-        };
-
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            Self::new(workspace, override_key, overrides, window, cx)
-        })
+        workspace.update_in(&mut cx, |workspace, window, cx| Self::new(workspace, window, cx))
     }
 
     fn new(
         workspace: &mut Workspace,
-        override_key: Option<String>,
-        overrides: HashMap<String, Category>,
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
@@ -148,154 +117,225 @@ impl DevPanel {
         let weak = workspace.weak_handle();
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-            let root = project
-                .read(cx)
-                .visible_worktrees(cx)
-                .next()
-                .map(|wt| wt.read(cx).abs_path());
+            let subscription = cx.subscribe(
+                &project,
+                |this: &mut Self, _project, event: &project::Event, cx| {
+                    if matches!(
+                        event,
+                        project::Event::WorktreeUpdatedEntries(..)
+                            | project::Event::WorktreeAdded(..)
+                            | project::Event::WorktreeRemoved(..)
+                    ) {
+                        this.schedule_detect(cx);
+                    }
+                },
+            );
             let mut panel = Self {
                 workspace: weak,
                 project,
                 focus_handle,
-                root,
                 runnables: Vec::new(),
-                overrides,
-                override_key,
                 containers: Vec::new(),
                 container_running: HashSet::default(),
                 running: HashMap::default(),
-                pending_save: Task::ready(()),
+                starting: HashSet::default(),
+                debounce_task: Task::ready(()),
+                scan_task: Task::ready(()),
+                status_task: Task::ready(()),
+                poll_task: Task::ready(()),
+                _subscriptions: vec![subscription],
                 position: DockPosition::Left,
                 width: None,
             };
             panel.detect(cx);
+            panel.start_status_polling(cx);
             panel
         })
     }
 
     // ─── detection ───────────────────────────────────────────────
 
-    /// Re-scan all supported project files and rebuild the runnable list.
+    /// Debounced rescan, so a burst of file-change events triggers one scan.
+    fn schedule_detect(&mut self, cx: &mut Context<Self>) {
+        self.debounce_task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            this.update(cx, |this, cx| this.detect(cx)).ok();
+        });
+    }
+
+    /// Walk every visible worktree and rebuild the runnable/container lists.
     fn detect(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else {
-            return;
-        };
+        let worktrees: Vec<_> = self.project.read(cx).visible_worktrees(cx).collect();
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut scan = ScanIndex::default();
+
+        for worktree in worktrees {
+            let snapshot = worktree.read(cx);
+            let root = snapshot.abs_path().to_path_buf();
+            for entry in snapshot.files(false, 0) {
+                let path = &entry.path;
+                if path.components().count() > MAX_MANIFEST_DEPTH {
+                    continue;
+                }
+                if path.components().any(|c| SKIP_DIRS.contains(&c)) {
+                    continue;
+                }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+                let extension = path.extension();
+                let dir_abs: Arc<Path> = path
+                    .parent()
+                    .map(|p| Arc::from(snapshot.absolutize(p).as_path()))
+                    .unwrap_or_else(|| Arc::from(root.as_path()));
+
+                // Index sibling markers used later for classification decisions.
+                match file_name {
+                    "pnpm-lock.yaml" => scan.set_pm(&dir_abs, "pnpm"),
+                    "yarn.lock" => scan.set_pm(&dir_abs, "yarn"),
+                    "bun.lockb" | "bun.lock" => scan.set_pm(&dir_abs, "bun"),
+                    "package-lock.json" => scan.set_pm(&dir_abs, "npm"),
+                    "poetry.lock" => {
+                        scan.poetry_dirs.insert(dir_abs.to_path_buf());
+                    }
+                    "pyproject.toml" => {
+                        scan.pyproject_dirs.insert(dir_abs.to_path_buf());
+                    }
+                    "manage.py" => {
+                        scan.managepy_dirs.insert(dir_abs.to_path_buf());
+                    }
+                    _ => {}
+                }
+
+                let parent_file_name = path.parent().and_then(|p| p.file_name());
+                let parent_has_cmd = path
+                    .parent()
+                    .is_some_and(|p| p.components().any(|c| c == "cmd"));
+                let kind = candidate_kind(file_name, extension, parent_file_name, parent_has_cmd);
+                if let Some(kind) = kind {
+                    candidates.push(Candidate {
+                        kind,
+                        abs: snapshot.absolutize(path),
+                        dir: dir_abs,
+                        file_name: file_name.to_string(),
+                    });
+                }
+            }
+        }
+
         let fs = self.project.read(cx).fs().clone();
-        cx.spawn(async move |this, cx| {
-            let mut runnables = Vec::new();
-
-            if let Ok(text) = fs.load(&root.join("package.json")).await {
-                let (pm, scripts) = parse_package_json(&text);
-                for name in scripts {
-                    let category = default_category(&name);
-                    runnables.push(Runnable {
-                        id: format!("npm:{name}"),
-                        label: name.clone(),
-                        program: pm.clone(),
-                        args: vec!["run".into(), name],
-                        default_category: category,
-                    });
-                }
-            }
-
-            if let Ok(text) = fs.load(&root.join("Makefile")).await {
-                for target in parse_makefile_targets(&text) {
-                    let category = default_category(&target);
-                    runnables.push(Runnable {
-                        id: format!("make:{target}"),
-                        label: format!("make {target}"),
-                        program: "make".into(),
-                        args: vec![target],
-                        default_category: category,
-                    });
-                }
-            }
-
-            if let Ok(text) = fs.load(&root.join("Procfile")).await {
-                for (name, command) in parse_procfile(&text) {
-                    // Procfile entries are always long-running processes.
-                    runnables.push(Runnable {
-                        id: format!("proc:{name}"),
-                        label: name,
-                        program: "sh".into(),
-                        args: vec!["-lc".into(), command],
-                        default_category: Category::Server,
-                    });
-                }
-            }
-
-            if let Ok(text) = fs.load(&root.join(".zed/tasks.json")).await {
-                for (label, command, args) in parse_zed_tasks(&text) {
-                    let category = default_category(&label);
-                    runnables.push(Runnable {
-                        id: format!("zed:{label}"),
-                        label,
-                        program: command,
-                        args,
-                        default_category: category,
-                    });
-                }
-            }
-
-            if let Ok(text) = fs.load(&root.join("Cargo.toml")).await {
-                if cargo_has_package(&text) {
-                    runnables.push(Runnable {
-                        id: "cargo:run".into(),
-                        label: "cargo run".into(),
-                        program: "cargo".into(),
-                        args: vec!["run".into()],
-                        default_category: Category::Server,
-                    });
-                }
-            }
-
-            dedup_runnables(&mut runnables);
-
-            let mut containers = Vec::new();
-            for name in COMPOSE_FILENAMES {
-                if let Ok(text) = fs.load(&root.join(name)).await {
-                    containers = parse_compose_services(&text);
-                    break;
-                }
-            }
-
+        self.scan_task = cx.spawn(async move |this, cx| {
+            let (runnables, containers) = scan_candidates(fs, candidates, scan).await;
             this.update(cx, |this, cx| {
                 this.runnables = runnables;
                 this.containers = containers;
+                // Drop status for containers that no longer exist.
+                let live: HashSet<String> = this.containers.iter().map(|c| c.id.clone()).collect();
+                this.container_running.retain(|id| live.contains(id));
                 this.refresh_container_status(cx);
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
     }
 
-    /// Probe `docker compose ps` and update which services are running.
+    /// Distinct compose invocations `(dir, explicit_file_name)` to probe/act on.
+    fn compose_invocations(&self) -> Vec<(Arc<Path>, Option<String>)> {
+        let mut seen = HashSet::default();
+        let mut out = Vec::new();
+        for container in &self.containers {
+            if seen.insert(container.compose_file.to_path_buf()) {
+                let explicit = container.explicit.then(|| container.file_name.clone());
+                out.push((container.dir.clone(), explicit));
+            }
+        }
+        out
+    }
+
+    /// Probe `docker compose ps` for every compose file and update status.
     fn refresh_container_status(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else {
+        // Group each container's (id, service) under its compose file.
+        let mut groups: HashMap<PathBuf, (Arc<Path>, Option<String>, Vec<(String, String)>)> =
+            HashMap::default();
+        for container in &self.containers {
+            let entry = groups
+                .entry(container.compose_file.to_path_buf())
+                .or_insert_with(|| {
+                    (
+                        container.dir.clone(),
+                        container.explicit.then(|| container.file_name.clone()),
+                        Vec::new(),
+                    )
+                });
+            entry.2.push((container.id.clone(), container.service.clone()));
+        }
+
+        if groups.is_empty() {
+            self.container_running.clear();
             return;
-        };
-        cx.spawn(async move |this, cx| {
-            let mut command = new_command("docker");
-            command
-                .args(["compose", "ps", "--format", "json"])
-                .current_dir(&root)
-                .env_remove("LD_LIBRARY_PATH")
-                .env_remove("LD_PRELOAD");
-            let running = match command.output().await {
-                Ok(output) => parse_running_services(&output.stdout),
-                Err(_) => HashSet::default(),
-            };
+        }
+        let jobs: Vec<(Arc<Path>, Option<String>, Vec<(String, String)>)> =
+            groups.into_values().collect();
+
+        self.status_task = cx.spawn(async move |this, cx| {
+            let mut running_ids = HashSet::default();
+            for (dir, explicit, rows) in jobs {
+                // No explicit `-p`: we let docker infer the project name from the
+                // working dir (its default), so status stays consistent with
+                // stacks started outside the panel. The trade-off is that two
+                // compose dirs sharing a basename would share a project — a rare
+                // case docker itself has the same way.
+                let mut command = new_command("docker");
+                command.arg("compose");
+                if let Some(file) = &explicit {
+                    command.args(["-f", file]);
+                }
+                command
+                    .args(["ps", "--format", "json"])
+                    .current_dir(&*dir)
+                    .env_remove("LD_LIBRARY_PATH")
+                    .env_remove("LD_PRELOAD");
+                if let Ok(output) = command.output().await {
+                    let running_services = parse_running_services(&output.stdout);
+                    for (id, service) in rows {
+                        if running_services.contains(&service) {
+                            running_ids.insert(id);
+                        }
+                    }
+                }
+            }
             this.update(cx, |this, cx| {
-                this.container_running = running;
+                this.container_running = running_ids;
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        });
     }
 
-    fn schedule_status_refresh(&self, cx: &mut Context<Self>) {
+    /// Poll container status every few seconds while the panel is alive.
+    fn start_status_polling(&mut self, cx: &mut Context<Self>) {
+        self.poll_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(5))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if !this.containers.is_empty() {
+                            this.refresh_container_status(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn schedule_status_refresh(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_secs(2))
@@ -306,80 +346,53 @@ impl DevPanel {
         .detach();
     }
 
-    // ─── category / classification ───────────────────────────────
-
-    fn category_of(&self, runnable: &Runnable) -> Category {
-        self.overrides
-            .get(&runnable.id)
-            .copied()
-            .unwrap_or(runnable.default_category)
-    }
+    // ─── categories ──────────────────────────────────────────────
 
     fn runnables_in(&self, category: Category) -> Vec<Runnable> {
         self.runnables
             .iter()
-            .filter(|r| self.category_of(r) == category)
+            .filter(|r| r.category == category)
             .cloned()
             .collect()
-    }
-
-    /// Flip a runnable between Server and Workflow and persist the choice.
-    fn reclassify(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(runnable) = self.runnables.iter().find(|r| r.id == id) else {
-            return;
-        };
-        let target = self.category_of(runnable).opposite();
-        if target == runnable.default_category {
-            self.overrides.remove(&id);
-        } else {
-            self.overrides.insert(id, target);
-        }
-        self.save_overrides(cx);
-        cx.notify();
-    }
-
-    fn save_overrides(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.override_key.clone() else {
-            return;
-        };
-        let Ok(value) = serde_json::to_string(&self.overrides) else {
-            return;
-        };
-        let kvp = KeyValueStore::global(cx);
-        self.pending_save = cx.background_spawn(async move {
-            kvp.write_kvp(key, value).await.ok();
-        });
     }
 
     // ─── run actions ─────────────────────────────────────────────
 
     fn start_runnable(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.starting.contains(&id) {
+            return;
+        }
         let Some(runnable) = self.runnables.iter().find(|r| r.id == id).cloned() else {
             return;
         };
         let Some(task) = self.spawn_terminal(
             &runnable.id,
-            runnable.label.clone(),
+            runnable.label.to_string(),
             &runnable.program,
             runnable.args.clone(),
+            &runnable.cwd,
             window,
             cx,
         ) else {
             return;
         };
+        self.starting.insert(id.clone());
         cx.spawn(async move |this, cx| {
-            if let Ok(handle) = task.await {
-                this.update(cx, |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.starting.remove(&id);
+                if let Ok(handle) = result {
                     this.running.insert(id, handle);
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
 
     fn stop_runnable(&mut self, id: String, cx: &mut Context<Self>) {
+        self.starting.remove(&id);
         if let Some(handle) = self.running.remove(&id) {
             if let Some(terminal) = handle.upgrade() {
                 terminal.update(cx, |terminal, _| terminal.input(vec![0x03]));
@@ -410,29 +423,38 @@ impl DevPanel {
         }
     }
 
-    fn toggle_container(&mut self, service: String, window: &mut Window, cx: &mut Context<Self>) {
-        let up = !self.container_running.contains(&service);
-        self.container_action(service, up, window, cx);
+    fn toggle_container(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let up = !self.container_running.contains(&id);
+        let Some(container) = self.containers.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        self.container_action(&container, up, window, cx);
     }
 
     fn container_action(
         &mut self,
-        service: String,
+        container: &Container,
         up: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (verb, label) = if up { ("up", "up") } else { ("stop", "down") };
-        let mut args = vec!["compose".to_string(), verb.to_string()];
-        if up {
-            args.push("-d".to_string());
+        let mut args = vec!["compose".to_string()];
+        if container.explicit {
+            args.push("-f".into());
+            args.push(container.file_name.clone());
         }
-        args.push(service.clone());
+        args.push(verb.into());
+        if up {
+            args.push("-d".into());
+        }
+        args.push(container.service.clone());
         if let Some(task) = self.spawn_terminal(
-            &format!("compose-{label}-{service}"),
-            format!("docker {label}: {service}"),
+            &format!("compose-{label}-{}", container.id),
+            format!("docker {label}: {}", container.service),
             "docker",
             args,
+            &container.dir,
             window,
             cx,
         ) {
@@ -442,36 +464,43 @@ impl DevPanel {
     }
 
     fn containers_all(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let (verb, extra): (&str, Vec<String>) = if up {
-            ("up", vec!["-d".into()])
-        } else {
-            ("stop", vec![])
-        };
-        let mut args = vec!["compose".to_string(), verb.to_string()];
-        args.extend(extra);
-        if let Some(task) = self.spawn_terminal(
-            &format!("compose-all-{verb}"),
-            format!("docker compose {verb} (all)"),
-            "docker",
-            args,
-            window,
-            cx,
-        ) {
-            task.detach();
+        let verb = if up { "up" } else { "stop" };
+        for (dir, explicit) in self.compose_invocations() {
+            let mut args = vec!["compose".to_string()];
+            if let Some(file) = &explicit {
+                args.push("-f".into());
+                args.push(file.clone());
+            }
+            args.push(verb.into());
+            if up {
+                args.push("-d".into());
+            }
+            if let Some(task) = self.spawn_terminal(
+                &format!("compose-all-{verb}-{}", dir.display()),
+                format!("docker compose {verb}"),
+                "docker",
+                args,
+                &dir,
+                window,
+                cx,
+            ) {
+                task.detach();
+            }
         }
         self.schedule_status_refresh(cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_terminal(
         &self,
         id: &str,
         label: String,
         program: &str,
         args: Vec<String>,
+        cwd: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<WeakEntity<Terminal>>>> {
-        let root = self.root.clone()?;
         let workspace = self.workspace.upgrade()?;
         let terminal_panel = workspace.read(cx).panel::<TerminalPanel>(cx)?;
         let spec = SpawnInTerminal {
@@ -480,7 +509,7 @@ impl DevPanel {
             label,
             command: Some(program.to_string()),
             args,
-            cwd: Some(root.to_path_buf()),
+            cwd: Some(cwd.to_path_buf()),
             reveal: RevealStrategy::Always,
             ..Default::default()
         };
@@ -488,19 +517,20 @@ impl DevPanel {
     }
 
     fn is_running(&self, id: &str) -> bool {
-        self.running
-            .get(id)
-            .and_then(|handle| handle.upgrade())
-            .is_some()
+        self.starting.contains(id)
+            || self
+                .running
+                .get(id)
+                .and_then(|handle| handle.upgrade())
+                .is_some()
     }
 
     // ─── rendering ───────────────────────────────────────────────
 
     fn render_runnable_row(&self, runnable: &Runnable, cx: &Context<Self>) -> AnyElement {
         let id = runnable.id.clone();
-        let is_server = self.category_of(runnable) == Category::Server;
+        let is_server = runnable.category == Category::Server;
         let running = self.is_running(&id);
-        let reclassify_id = id.clone();
         let toggle_id = id.clone();
 
         let action_button = if is_server {
@@ -520,12 +550,6 @@ impl DevPanel {
                 }))
         };
 
-        let move_tip = if is_server {
-            "Move to Scripts"
-        } else {
-            "Move to Servers"
-        };
-
         h_flex()
             .id(SharedString::from(format!("row-{id}")))
             .w_full()
@@ -537,27 +561,15 @@ impl DevPanel {
                     .when(is_server, |el| el.child(status_dot(running)))
                     .child(Label::new(runnable.label.clone()).size(LabelSize::Small)),
             )
-            .child(
-                h_flex()
-                    .gap_0p5()
-                    .child(
-                        IconButton::new("reclassify", IconName::ArrowCircle)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text(move_tip))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.reclassify(reclassify_id.clone(), cx)
-                            })),
-                    )
-                    .child(action_button),
-            )
+            .child(action_button)
             .into_any_element()
     }
 
-    fn render_container_row(&self, service: &str, cx: &Context<Self>) -> AnyElement {
-        let name = service.to_string();
-        let running = self.container_running.contains(service);
+    fn render_container_row(&self, container: &Container, cx: &Context<Self>) -> AnyElement {
+        let id = container.id.clone();
+        let running = self.container_running.contains(&id);
         h_flex()
-            .id(SharedString::from(format!("container-{name}")))
+            .id(SharedString::from(format!("container-{id}")))
             .w_full()
             .justify_between()
             .py_0p5()
@@ -565,13 +577,13 @@ impl DevPanel {
                 h_flex()
                     .gap_1p5()
                     .child(status_dot(running))
-                    .child(Label::new(service.to_string()).size(LabelSize::Small)),
+                    .child(Label::new(container.label.clone()).size(LabelSize::Small)),
             )
             .child(toggle_button(
                 "container",
                 running,
                 cx.listener(move |this, _, window, cx| {
-                    this.toggle_container(name.clone(), window, cx)
+                    this.toggle_container(id.clone(), window, cx)
                 }),
             ))
             .into_any_element()
@@ -654,15 +666,15 @@ impl Render for DevPanel {
             .iter()
             .map(|r| self.render_runnable_row(r, cx))
             .collect();
-        let workflow_rows: Vec<AnyElement> = self
-            .runnables_in(Category::Workflow)
+        let script_rows: Vec<AnyElement> = self
+            .runnables_in(Category::Script)
             .iter()
             .map(|r| self.render_runnable_row(r, cx))
             .collect();
         let container_rows: Vec<AnyElement> = self
             .containers
             .iter()
-            .map(|s| self.render_container_row(s, cx))
+            .map(|c| self.render_container_row(c, cx))
             .collect();
 
         let server_actions = vec![
@@ -704,14 +716,7 @@ impl Render for DevPanel {
                     .w_full()
                     .px_2()
                     .py_1()
-                    .justify_between()
-                    .child(Label::new("Dev").size(LabelSize::Default))
-                    .child(
-                        IconButton::new("refresh", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, _, cx| this.detect(cx))),
-                    ),
+                    .child(Label::new("Dev").size(LabelSize::Default)),
             )
             .child(
                 v_flex()
@@ -723,7 +728,7 @@ impl Render for DevPanel {
                     .gap_3()
                     .child(self.render_section("SERVERS", server_actions, server_rows))
                     .child(self.render_section("CONTAINERS", container_actions, container_rows))
-                    .child(self.render_section("SCRIPTS", Vec::new(), workflow_rows)),
+                    .child(self.render_section("SCRIPTS", Vec::new(), script_rows)),
             )
     }
 }
@@ -773,290 +778,5 @@ impl Panel for DevPanel {
 
     fn activation_priority(&self) -> u32 {
         5
-    }
-}
-
-// ─── detection helpers (pure, unit-tested) ───────────────────────
-
-const COMPOSE_FILENAMES: &[&str] = &[
-    "docker-compose.yaml",
-    "docker-compose.yml",
-    "compose.yaml",
-    "compose.yml",
-];
-
-/// First path segment of a name matching these → treated as a server.
-const SERVER_HINTS: &[&str] = &["dev", "start", "serve", "watch", "run"];
-
-fn default_category(name: &str) -> Category {
-    let head = name.split([':', '-', ' ']).next().unwrap_or(name);
-    if SERVER_HINTS.contains(&head) {
-        Category::Server
-    } else {
-        Category::Workflow
-    }
-}
-
-fn dedup_runnables(runnables: &mut Vec<Runnable>) {
-    let mut seen = HashSet::default();
-    runnables.retain(|r| seen.insert(r.id.clone()));
-}
-
-/// Parse `package.json`, returning the package manager and script names.
-fn parse_package_json(text: &str) -> (String, Vec<String>) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return ("npm".to_string(), Vec::new());
-    };
-    let pm = value
-        .get("packageManager")
-        .and_then(|v| v.as_str())
-        .map(package_manager_from_field)
-        .unwrap_or("npm")
-        .to_string();
-    let scripts = value
-        .get("scripts")
-        .and_then(|s| s.as_object())
-        .map(|obj| obj.keys().cloned().collect())
-        .unwrap_or_default();
-    (pm, scripts)
-}
-
-fn package_manager_from_field(field: &str) -> &'static str {
-    if field.starts_with("pnpm") {
-        "pnpm"
-    } else if field.starts_with("yarn") {
-        "yarn"
-    } else if field.starts_with("bun") {
-        "bun"
-    } else {
-        "npm"
-    }
-}
-
-/// Extract non-special target names from a Makefile.
-fn parse_makefile_targets(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::default();
-    for line in text.lines() {
-        // Recipe lines are indented; target lines start at column 0.
-        if line.starts_with([' ', '\t']) {
-            continue;
-        }
-        let Some(idx) = line.find(':') else {
-            continue;
-        };
-        // Skip `NAME := value` variable assignments.
-        if line[idx..].starts_with(":=") {
-            continue;
-        }
-        let name = line[..idx].trim();
-        if name.is_empty()
-            || name.starts_with('.')
-            || name.contains(['%', '$', '=', '/', ' ', '\t'])
-        {
-            continue;
-        }
-        if seen.insert(name.to_string()) {
-            out.push(name.to_string());
-        }
-    }
-    out
-}
-
-/// Parse `Procfile` lines into `(process_name, command)` pairs.
-fn parse_procfile(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (name, command) = line.split_once(':')?;
-            let (name, command) = (name.trim(), command.trim());
-            if name.is_empty() || command.is_empty() {
-                return None;
-            }
-            Some((name.to_string(), command.to_string()))
-        })
-        .collect()
-}
-
-/// Parse `.zed/tasks.json` (lenient JSON — trailing commas allowed) into
-/// `(label, command, args)` tuples.
-fn parse_zed_tasks(text: &str) -> Vec<(String, String, Vec<String>)> {
-    #[derive(Deserialize)]
-    struct ZedTaskDef {
-        label: String,
-        command: String,
-        #[serde(default)]
-        args: Vec<String>,
-    }
-    serde_json_lenient::from_str::<Vec<ZedTaskDef>>(text)
-        .map(|tasks| {
-            tasks
-                .into_iter()
-                .map(|t| (t.label, t.command, t.args))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn cargo_has_package(text: &str) -> bool {
-    text.lines().any(|l| l.trim_start().starts_with("[package]"))
-}
-
-/// Extract the `services:` keys from a docker-compose YAML document.
-fn parse_compose_services(text: &str) -> Vec<String> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
-        return Vec::new();
-    };
-    value
-        .get("services")
-        .and_then(|s| s.as_mapping())
-        .map(|map| {
-            map.keys()
-                .filter_map(|k| k.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[derive(Deserialize)]
-struct ComposePsRow {
-    #[serde(rename = "Service")]
-    service: Option<String>,
-    #[serde(rename = "State")]
-    state: Option<String>,
-}
-
-/// Parse `docker compose ps --format json` output into the running-service set.
-fn parse_running_services(stdout: &[u8]) -> HashSet<String> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut running = HashSet::default();
-    let mut consider = |row: ComposePsRow| {
-        if let (Some(service), Some(state)) = (row.service, row.state) {
-            let s = state.to_ascii_lowercase();
-            if s.contains("running") || s.starts_with("up") {
-                running.insert(service);
-            }
-        }
-    };
-    if let Ok(rows) = serde_json::from_str::<Vec<ComposePsRow>>(text.trim()) {
-        rows.into_iter().for_each(&mut consider);
-    } else {
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            if let Ok(row) = serde_json::from_str::<ComposePsRow>(line) {
-                consider(row);
-            }
-        }
-    }
-    running
-}
-
-/// KV key for a workspace's category overrides, based on its first worktree.
-fn override_key(workspace: &Workspace, cx: &App) -> Option<String> {
-    let root = workspace
-        .project()
-        .read(cx)
-        .visible_worktrees(cx)
-        .next()?
-        .read(cx)
-        .abs_path();
-    Some(format!("dev_panel::overrides::{}", root.display()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_scripts_and_package_manager() {
-        let json = r#"{ "packageManager": "pnpm@11.13.0",
-            "scripts": { "dev": "x", "build": "y", "dev:portal": "z" } }"#;
-        let (pm, mut scripts) = parse_package_json(json);
-        scripts.sort();
-        assert_eq!(pm, "pnpm");
-        assert_eq!(scripts, vec!["build", "dev", "dev:portal"]);
-    }
-
-    #[test]
-    fn categorizes_by_head_segment() {
-        assert_eq!(default_category("dev"), Category::Server);
-        assert_eq!(default_category("dev:portal"), Category::Server);
-        assert_eq!(default_category("run-dev"), Category::Server);
-        assert_eq!(default_category("watch"), Category::Server);
-        assert_eq!(default_category("build"), Category::Workflow);
-        assert_eq!(default_category("test:unit"), Category::Workflow);
-    }
-
-    #[test]
-    fn parses_makefile_targets_skipping_specials() {
-        let mk = "\
-.PHONY: all\n\
-all: lint test\n\
-run-dev:\n\t./run\n\
-build-apk:\n\tflutter build\n\
-VAR := value\n\
-%.o: %.c\n";
-        let targets = parse_makefile_targets(mk);
-        assert!(targets.contains(&"all".to_string()));
-        assert!(targets.contains(&"run-dev".to_string()));
-        assert!(targets.contains(&"build-apk".to_string()));
-        assert!(!targets.iter().any(|t| t.starts_with('.')));
-        assert!(!targets.iter().any(|t| t.contains('%')));
-        assert!(!targets.contains(&"VAR".to_string()));
-    }
-
-    #[test]
-    fn parses_procfile_entries() {
-        let pf = "web: cargo run --package collab serve all\n# comment\nworker: sh worker.sh\n";
-        let entries = parse_procfile(pf);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, "web");
-        assert_eq!(entries[0].1, "cargo run --package collab serve all");
-        assert_eq!(entries[1].0, "worker");
-    }
-
-    #[test]
-    fn parses_zed_tasks_with_trailing_commas() {
-        let tasks = "[\n  { \"label\": \"clippy\", \"command\": \"./script/clippy\", \"args\": [], },\n  { \"label\": \"run\", \"command\": \"cargo\", \"args\": [\"run\"], },\n]";
-        let parsed = parse_zed_tasks(tasks);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "clippy");
-        assert_eq!(parsed[1].1, "cargo");
-        assert_eq!(parsed[1].2, vec!["run".to_string()]);
-    }
-
-    #[test]
-    fn detects_cargo_package() {
-        assert!(cargo_has_package("[package]\nname = \"x\"\n"));
-        assert!(!cargo_has_package("[workspace]\nmembers = []\n"));
-    }
-
-    #[test]
-    fn parses_compose_services() {
-        let yaml = "services:\n  postgres:\n    image: postgres\n  minio:\n    image: minio\n";
-        let mut services = parse_compose_services(yaml);
-        services.sort();
-        assert_eq!(services, vec!["minio", "postgres"]);
-    }
-
-    #[test]
-    fn parses_running_services() {
-        let out = br#"{"Service":"postgres","State":"running"}
-{"Service":"minio","State":"exited"}"#;
-        let running = parse_running_services(out);
-        assert!(running.contains("postgres"));
-        assert!(!running.contains("minio"));
-    }
-
-    #[test]
-    fn category_serde_roundtrips_lowercase() {
-        let mut map = HashMap::default();
-        map.insert("npm:dev".to_string(), Category::Workflow);
-        let json = serde_json::to_string(&map).unwrap();
-        assert!(json.contains("\"workflow\""));
-        let back: HashMap<String, Category> = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.get("npm:dev"), Some(&Category::Workflow));
     }
 }
