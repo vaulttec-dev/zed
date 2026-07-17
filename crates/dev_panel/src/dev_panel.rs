@@ -380,9 +380,17 @@ impl DevPanel {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.starting.remove(&id);
+                // `starting` still holds the id unless Stop was clicked during the
+                // launch window. If it was, interrupt the process that just spawned
+                // rather than registering it as running (which would silently undo
+                // the user's Stop and leak the process).
+                let still_wanted = this.starting.remove(&id);
                 if let Ok(handle) = result {
-                    this.running.insert(id, handle);
+                    if still_wanted {
+                        this.running.insert(id, handle);
+                    } else if let Some(terminal) = handle.upgrade() {
+                        terminal.update(cx, |terminal, _| terminal.input(vec![0x03]));
+                    }
                 }
                 cx.notify();
             })
