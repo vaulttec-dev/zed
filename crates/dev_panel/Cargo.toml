@@ -14,6 +14,7 @@ path = "src/dev_panel.rs"
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+editor.workspace = true
 gpui.workspace = true
 project.workspace = true
 serde.workspace = true

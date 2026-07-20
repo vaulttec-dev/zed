@@ -27,12 +27,14 @@ mod classification;
 mod detection;
 mod parsers;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use collections::{HashMap, HashSet};
+use editor::{Editor, EditorEvent};
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, Task, WeakEntity,
@@ -78,6 +80,8 @@ pub struct DevPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
+    /// Single-line filter that narrows every section by label substring.
+    filter_editor: Entity<Editor>,
     runnables: Vec<Runnable>,
     containers: Vec<Container>,
     /// Ids of containers currently reported as running.
@@ -110,11 +114,16 @@ impl DevPanel {
 
     fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let project = workspace.project().clone();
         let weak = workspace.weak_handle();
+        let filter_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter…", window, cx);
+            editor
+        });
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             let subscription = cx.subscribe(
@@ -130,10 +139,17 @@ impl DevPanel {
                     }
                 },
             );
+            let filter_subscription =
+                cx.subscribe(&filter_editor, |_this, _editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        cx.notify();
+                    }
+                });
             let mut panel = Self {
                 workspace: weak,
                 project,
                 focus_handle,
+                filter_editor,
                 runnables: Vec::new(),
                 containers: Vec::new(),
                 container_running: HashSet::default(),
@@ -143,7 +159,7 @@ impl DevPanel {
                 scan_task: Task::ready(()),
                 status_task: Task::ready(()),
                 poll_task: Task::ready(()),
-                _subscriptions: vec![subscription],
+                _subscriptions: vec![subscription, filter_subscription],
                 position: DockPosition::Left,
                 width: None,
             };
@@ -354,6 +370,77 @@ impl DevPanel {
             .filter(|r| r.category == category)
             .cloned()
             .collect()
+    }
+
+    /// The lowercased filter text, or `None` when the field is empty.
+    fn filter_query(&self, cx: &App) -> Option<String> {
+        let query = self.filter_editor.read(cx).text(cx).trim().to_lowercase();
+        (!query.is_empty()).then_some(query)
+    }
+
+    /// The runnable/container's directory relative to its worktree root, used as
+    /// the grouping header. The root itself renders as the project folder's name so
+    /// root-level entries don't collapse into a blank group.
+    fn folder_label(&self, dir: &Path, cx: &App) -> String {
+        for worktree in self.project.read(cx).visible_worktrees(cx) {
+            let root = worktree.read(cx).abs_path();
+            if let Ok(relative) = dir.strip_prefix(&root) {
+                if relative.as_os_str().is_empty() {
+                    return root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                }
+                return relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+            }
+        }
+        dir.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Group a category's rows by folder, dropping entries that don't match the
+    /// query (checked against both the label and the folder path). Groups are
+    /// returned sorted by folder path.
+    fn grouped_runnable_rows(
+        &self,
+        category: Category,
+        query: Option<&str>,
+        cx: &Context<Self>,
+    ) -> Vec<(String, Vec<AnyElement>)> {
+        let mut groups: BTreeMap<String, Vec<AnyElement>> = BTreeMap::new();
+        for runnable in self.runnables.iter().filter(|r| r.category == category) {
+            let folder = self.folder_label(&runnable.cwd, cx);
+            if !row_matches(&runnable.label, &folder, query) {
+                continue;
+            }
+            groups
+                .entry(folder)
+                .or_default()
+                .push(self.render_runnable_row(runnable, cx));
+        }
+        groups.into_iter().collect()
+    }
+
+    fn grouped_container_rows(
+        &self,
+        query: Option<&str>,
+        cx: &Context<Self>,
+    ) -> Vec<(String, Vec<AnyElement>)> {
+        let mut groups: BTreeMap<String, Vec<AnyElement>> = BTreeMap::new();
+        for container in &self.containers {
+            let folder = self.folder_label(&container.dir, cx);
+            if !row_matches(&container.label, &folder, query) {
+                continue;
+            }
+            groups
+                .entry(folder)
+                .or_default()
+                .push(self.render_container_row(container, cx));
+        }
+        groups.into_iter().collect()
     }
 
     // ─── run actions ─────────────────────────────────────────────
@@ -601,8 +688,12 @@ impl DevPanel {
         &self,
         title: &'static str,
         actions: Vec<AnyElement>,
-        rows: Vec<AnyElement>,
+        groups: Vec<(String, Vec<AnyElement>)>,
     ) -> impl IntoElement {
+        // A single folder (the common non-monorepo case) needs no folder header —
+        // render its rows flat. With several folders, each gets a header so entries
+        // from different parts of the tree don't blur together.
+        let show_folders = groups.len() > 1;
         v_flex()
             .w_full()
             .gap_0p5()
@@ -617,8 +708,34 @@ impl DevPanel {
                     )
                     .child(h_flex().gap_0p5().children(actions)),
             )
-            .children(rows)
+            .children(groups.into_iter().map(|(folder, rows)| {
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .when(show_folders, |el| {
+                        el.child(
+                            Label::new(folder)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .when(show_folders, |el| el.pl_2())
+                            .children(rows),
+                    )
+            }))
     }
+}
+
+/// Case-insensitive match against either the label or the folder path; an absent
+/// query matches everything.
+fn row_matches(label: &str, folder: &str, query: Option<&str>) -> bool {
+    query.is_none_or(|query| {
+        label.to_lowercase().contains(query) || folder.to_lowercase().contains(query)
+    })
 }
 
 /// Green dot when running, muted dot otherwise.
@@ -669,21 +786,11 @@ impl EventEmitter<PanelEvent> for DevPanel {}
 
 impl Render for DevPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let server_rows: Vec<AnyElement> = self
-            .runnables_in(Category::Server)
-            .iter()
-            .map(|r| self.render_runnable_row(r, cx))
-            .collect();
-        let script_rows: Vec<AnyElement> = self
-            .runnables_in(Category::Script)
-            .iter()
-            .map(|r| self.render_runnable_row(r, cx))
-            .collect();
-        let container_rows: Vec<AnyElement> = self
-            .containers
-            .iter()
-            .map(|c| self.render_container_row(c, cx))
-            .collect();
+        let query = self.filter_query(cx);
+        let query = query.as_deref();
+        let server_rows = self.grouped_runnable_rows(Category::Server, query, cx);
+        let script_rows = self.grouped_runnable_rows(Category::Script, query, cx);
+        let container_rows = self.grouped_container_rows(query, cx);
 
         let server_actions = vec![
             mini_button(
@@ -725,6 +832,20 @@ impl Render for DevPanel {
                     .px_2()
                     .py_1()
                     .child(Label::new("Dev").size(LabelSize::Default)),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px_2()
+                    .pb_1()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(self.filter_editor.clone()),
             )
             .child(
                 v_flex()

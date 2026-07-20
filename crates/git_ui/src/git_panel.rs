@@ -904,6 +904,7 @@ pub struct GitPanel {
     conflicted_staged_count: usize,
     add_coauthors: bool,
     generate_commit_message_task: Option<Task<Option<()>>>,
+    generate_branch_task: Option<Task<Option<()>>>,
     entries: Vec<GitListEntry>,
     view_mode: GitPanelViewMode,
     tree_expanded_dirs: HashMap<TreeKey, bool>,
@@ -1208,6 +1209,7 @@ impl GitPanel {
                 conflicted_staged_count: 0,
                 add_coauthors: true,
                 generate_commit_message_task: None,
+                generate_branch_task: None,
                 entries: Vec::new(),
                 view_mode: GitPanelViewMode::from_settings(cx),
                 tree_expanded_dirs: HashMap::default(),
@@ -3484,6 +3486,169 @@ impl GitPanel {
         }));
     }
 
+    /// Ask the configured model for a short branch name that summarizes the
+    /// current diff, then create and switch to that branch. Uses the whole
+    /// worktree diff (staged + unstaged) so it works before anything is staged.
+    pub fn generate_and_create_branch(&mut self, cx: &mut Context<Self>) {
+        if self.generate_branch_task.is_some() || !AgentSettings::get_global(cx).enabled(cx) {
+            return;
+        }
+
+        let Some(ConfiguredModel { provider, model }) =
+            LanguageModelRegistry::read_global(cx).commit_message_model(cx)
+        else {
+            return;
+        };
+
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+
+        telemetry::event!("Git Branch Name Generated");
+
+        let diff = repo.update(cx, |repo, cx| repo.diff(DiffType::HeadToWorktree, cx));
+        let temperature = AgentSettings::temperature_for_model(&model, cx);
+
+        self.generate_branch_task = Some(cx.spawn(async move |this, cx| {
+            async move {
+                let _defer = cx.on_drop(&this, |this, _cx| {
+                    this.generate_branch_task.take();
+                });
+
+                if let Some(task) = cx.update(|cx| {
+                    if !provider.is_authenticated(cx) {
+                        Some(provider.authenticate(cx))
+                    } else {
+                        None
+                    }
+                }) {
+                    task.await.log_err();
+                }
+
+                let mut diff_text = match diff.await {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(e)) => {
+                        Self::show_branch_error(&this, &e, cx);
+                        return anyhow::Ok(());
+                    }
+                    Err(e) => {
+                        Self::show_branch_error(&this, &e, cx);
+                        return anyhow::Ok(());
+                    }
+                };
+
+                if diff_text.trim().is_empty() {
+                    Self::show_branch_error(&this, &"there are no changes to describe", cx);
+                    return anyhow::Ok(());
+                }
+
+                const MAX_DIFF_BYTES: usize = 20_000;
+                diff_text = Self::compress_commit_diff(&diff_text, MAX_DIFF_BYTES);
+
+                let prompt = include_str!("../src/branch_name_prompt.txt");
+                let content = format!("{prompt}{diff_text}");
+
+                let request = LanguageModelRequest {
+                    thread_id: None,
+                    prompt_id: None,
+                    intent: Some(CompletionIntent::GenerateGitCommitMessage),
+                    messages: vec![LanguageModelRequestMessage {
+                        role: Role::User,
+                        content: vec![content.into()],
+                        cache: false,
+                        reasoning_details: None,
+                    }],
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    stop: Vec::new(),
+                    temperature,
+                    thinking_allowed: false,
+                    thinking_effort: None,
+                    speed: None,
+                    compact_at_tokens: None,
+                };
+
+                let mut raw_name = String::new();
+                match model.stream_completion_text(request, cx).await {
+                    Ok(mut messages) => {
+                        while let Some(message) = messages.stream.next().await {
+                            match message {
+                                Ok(text) => raw_name.push_str(&text),
+                                Err(e) => {
+                                    Self::show_branch_error(&this, &e, cx);
+                                    return anyhow::Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        Self::show_branch_error(&this, &e, cx);
+                        return anyhow::Ok(());
+                    }
+                }
+
+                let branch_name = Self::sanitize_branch_name(&raw_name);
+                if branch_name.is_empty() {
+                    Self::show_branch_error(
+                        &this,
+                        &"the model returned an empty branch name",
+                        cx,
+                    );
+                    return anyhow::Ok(());
+                }
+
+                match repo
+                    .update(cx, |repo, _| repo.create_branch(branch_name, None))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => Self::show_branch_error(&this, &e, cx),
+                    Err(e) => Self::show_branch_error(&this, &e, cx),
+                }
+
+                anyhow::Ok(())
+            }
+            .log_err()
+            .await
+        }));
+    }
+
+    /// Coerce arbitrary model output into a valid kebab-case branch name: a
+    /// single line, lowercased, with runs of non-alphanumerics collapsed to one
+    /// hyphen. A single slash is preserved so a `feat/…` style prefix survives.
+    fn sanitize_branch_name(raw: &str) -> String {
+        let line = raw.trim().lines().next().unwrap_or_default();
+        let mut result = String::with_capacity(line.len());
+        let mut pending_separator = false;
+        for ch in line.chars() {
+            let ch = ch.to_ascii_lowercase();
+            if ch.is_ascii_alphanumeric() {
+                if pending_separator && !result.is_empty() {
+                    result.push('-');
+                }
+                pending_separator = false;
+                result.push(ch);
+            } else if ch == '/' && !result.is_empty() && !result.ends_with('/') {
+                pending_separator = false;
+                result.push('/');
+            } else {
+                pending_separator = true;
+            }
+        }
+        result.trim_matches(['-', '/']).to_string()
+    }
+
+    fn show_branch_error<E>(weak_this: &WeakEntity<Self>, err: &E, cx: &mut AsyncApp)
+    where
+        E: std::fmt::Debug + std::fmt::Display,
+    {
+        if let Ok(Some(workspace)) = weak_this.update(cx, |this, _cx| this.workspace.upgrade()) {
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.show_error(format!("Failed to generate branch name: {err}"), cx);
+            });
+        }
+    }
+
     fn get_fetch_options(
         &self,
         window: &mut Window,
@@ -5631,6 +5796,41 @@ impl GitPanel {
                         self.remote_action_menu_handle.clone(),
                     ))
                 })
+                .into_any_element(),
+        )
+    }
+
+    /// The button that generates a branch name from the current diff and creates
+    /// the branch. Only shown when a commit-message model is configured.
+    pub(crate) fn render_generate_branch_button(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.active_repository.is_none() || !AgentSettings::get_global(cx).enabled(cx) {
+            return None;
+        }
+        if LanguageModelRegistry::read_global(cx)
+            .commit_message_model(cx)
+            .is_none()
+        {
+            return None;
+        }
+
+        let generating = self.generate_branch_task.is_some();
+        let tooltip = if generating {
+            "Generating branch name…"
+        } else {
+            "Create branch from changes (AI)"
+        };
+
+        Some(
+            IconButton::new("generate-branch", IconName::GitBranchPlus)
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(tooltip))
+                .disabled(generating)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.generate_and_create_branch(cx);
+                }))
                 .into_any_element(),
         )
     }
@@ -8377,6 +8577,11 @@ impl RenderOnce for PanelRepoFooter {
                     })
                     .child(div().child(branch_selector).min_w_0()),
             )
+            .children(self.git_panel.as_ref().and_then(|git_panel| {
+                git_panel.update(cx, |git_panel, cx| {
+                    git_panel.render_generate_branch_button(cx)
+                })
+            }))
             .children(if let Some(git_panel) = self.git_panel {
                 git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
             } else {
