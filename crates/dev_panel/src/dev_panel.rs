@@ -452,31 +452,56 @@ impl DevPanel {
         let Some(runnable) = self.runnables.iter().find(|r| r.id == id).cloned() else {
             return;
         };
-        let Some(task) = self.spawn_terminal(
-            &runnable.id,
-            runnable.label.to_string(),
-            &runnable.program,
-            runnable.args.clone(),
-            &runnable.cwd,
-            window,
-            cx,
-        ) else {
-            return;
-        };
-        self.starting.insert(id.clone());
-        cx.spawn(async move |this, cx| {
+        // Reflect the pending start immediately so the row flips to "running"
+        // while the stale-process sweep and terminal launch happen off-thread.
+        self.starting.insert(id);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            // A server left over from a previous session (or one the panel lost
+            // track of after a Zed restart) still holds its port, so a fresh
+            // launch would fail to bind. Reap any process with this server's exact
+            // command and working directory before starting a new one.
+            {
+                let program = runnable.program.clone();
+                let args = runnable.args.clone();
+                let cwd = runnable.cwd.clone();
+                cx.background_spawn(async move { kill_stale_processes(&program, &args, &cwd) })
+                    .await;
+            }
+            let task = this
+                .update_in(cx, |this, window, cx| {
+                    this.spawn_terminal(
+                        &runnable.id,
+                        runnable.label.to_string(),
+                        &runnable.program,
+                        runnable.args.clone(),
+                        &runnable.cwd,
+                        window,
+                        cx,
+                    )
+                })
+                .ok()
+                .flatten();
+            let Some(task) = task else {
+                this.update(cx, |this, cx| {
+                    this.starting.remove(&runnable.id);
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
             let result = task.await;
             this.update(cx, |this, cx| {
                 // `starting` still holds the id unless Stop was clicked during the
                 // launch window. If it was, interrupt the process that just spawned
                 // rather than registering it as running (which would silently undo
                 // the user's Stop and leak the process).
-                let still_wanted = this.starting.remove(&id);
+                let still_wanted = this.starting.remove(&runnable.id);
                 if let Ok(handle) = result {
                     if still_wanted {
-                        this.running.insert(id, handle);
+                        this.running.insert(runnable.id, handle);
                     } else if let Some(terminal) = handle.upgrade() {
-                        terminal.update(cx, |terminal, _| terminal.input(vec![0x03]));
+                        terminal.update(cx, |terminal, _| terminal.kill_active_task());
                     }
                 }
                 cx.notify();
@@ -490,7 +515,7 @@ impl DevPanel {
         self.starting.remove(&id);
         if let Some(handle) = self.running.remove(&id) {
             if let Some(terminal) = handle.upgrade() {
-                terminal.update(cx, |terminal, _| terminal.input(vec![0x03]));
+                terminal.update(cx, |terminal, _| terminal.kill_active_task());
             }
         }
         cx.notify();
@@ -729,6 +754,59 @@ impl DevPanel {
             }))
     }
 }
+
+/// Kill any already-running process whose command and working directory match
+/// this server exactly, so a restart doesn't fail because a stale instance still
+/// holds the port. Matching on the concrete command + cwd (rather than a port
+/// the panel can't reliably know) avoids killing an unrelated process that merely
+/// happens to share a port.
+#[cfg(unix)]
+fn kill_stale_processes(program: &str, args: &[String], cwd: &Path) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let program_name = Path::new(program).file_name();
+    let refresh_kind = ProcessRefreshKind::nothing()
+        .with_cmd(UpdateKind::Always)
+        .with_cwd(UpdateKind::Always);
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+
+    let own_pid = std::process::id();
+    for (pid, process) in system.processes() {
+        if pid.as_u32() == own_pid {
+            continue;
+        }
+        let Some((head, tail)) = process.cmd().split_first() else {
+            continue;
+        };
+        if Path::new(head).file_name() != program_name {
+            continue;
+        }
+        if tail.len() != args.len()
+            || !tail
+                .iter()
+                .zip(args)
+                .all(|(actual, expected)| actual.to_str() == Some(expected.as_str()))
+        {
+            continue;
+        }
+        if process.cwd() != Some(cwd) {
+            continue;
+        }
+        // Kill the whole process group so children (the real server binary behind
+        // `cargo run`, esbuild behind vite, …) die too and release the port. Fall
+        // back to the process itself if it isn't a group leader.
+        let raw = pid.as_u32() as i32;
+        let pgid = unsafe { libc::getpgid(raw) };
+        let target = if pgid > 0 { pgid } else { raw };
+        unsafe {
+            libc::killpg(target, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_stale_processes(_program: &str, _args: &[String], _cwd: &Path) {}
 
 /// Case-insensitive match against either the label or the folder path; an absent
 /// query matches everything.
