@@ -228,6 +228,14 @@ pub fn init(cx: &mut App) {
                     panel.pull(true, window, cx);
                 });
             });
+            workspace.register_action(|workspace, _: &git::PullDefaultBranch, window, cx| {
+                let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.pull_default_branch(window, cx);
+                });
+            });
         }
         workspace.register_action(|workspace, action: &git::StashAll, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
@@ -767,6 +775,7 @@ fn show_ref_picker(
 fn render_remote_button(
     id: impl Into<SharedString>,
     branch: &Branch,
+    default_branch_menu_label: Option<SharedString>,
     keybinding_target: Option<FocusHandle>,
     show_fetch_button: bool,
     in_progress_operation: Option<RemoteOperationKind>,
@@ -782,6 +791,7 @@ fn render_remote_button(
             (0, 0) if show_fetch_button => Some(remote_button::render_fetch_button(
                 keybinding_target,
                 id,
+                default_branch_menu_label,
                 in_progress_operation,
                 menu_handle,
             )),
@@ -790,6 +800,7 @@ fn render_remote_button(
                 keybinding_target,
                 id,
                 ahead,
+                default_branch_menu_label,
                 in_progress_operation,
                 menu_handle,
             )),
@@ -798,6 +809,7 @@ fn render_remote_button(
                 id,
                 ahead,
                 behind,
+                default_branch_menu_label,
                 in_progress_operation,
                 menu_handle,
             )),
@@ -808,12 +820,14 @@ fn render_remote_button(
         }) => Some(remote_button::render_republish_button(
             keybinding_target,
             id,
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
         )),
         None => Some(remote_button::render_publish_button(
             keybinding_target,
             id,
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
         )),
@@ -831,6 +845,7 @@ mod remote_button {
     pub fn render_fetch_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
@@ -841,6 +856,7 @@ mod remote_button {
             0,
             Some(IconName::ArrowCircle),
             keybinding_target.clone(),
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
             move |_, window, cx| {
@@ -862,6 +878,7 @@ mod remote_button {
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
         ahead: u32,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
@@ -872,6 +889,7 @@ mod remote_button {
             0,
             None,
             keybinding_target.clone(),
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
             move |_, window, cx| {
@@ -894,6 +912,7 @@ mod remote_button {
         id: SharedString,
         ahead: u32,
         behind: u32,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
@@ -904,6 +923,7 @@ mod remote_button {
             behind as usize,
             None,
             keybinding_target.clone(),
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
             move |_, window, cx| {
@@ -924,6 +944,7 @@ mod remote_button {
     pub fn render_publish_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
@@ -934,6 +955,7 @@ mod remote_button {
             0,
             Some(IconName::ExpandUp),
             keybinding_target.clone(),
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
             move |_, window, cx| {
@@ -954,6 +976,7 @@ mod remote_button {
     pub fn render_republish_button(
         keybinding_target: Option<FocusHandle>,
         id: SharedString,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
@@ -964,6 +987,7 @@ mod remote_button {
             0,
             Some(IconName::ExpandUp),
             keybinding_target.clone(),
+            default_branch_menu_label,
             in_progress_operation,
             menu_handle,
             move |_, window, cx| {
@@ -1009,6 +1033,7 @@ mod remote_button {
     fn render_git_action_menu(
         id: impl Into<ElementId>,
         keybinding_target: Option<FocusHandle>,
+        default_branch_menu_label: Option<SharedString>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> impl IntoElement {
         let menu_open = menu_handle.is_deployed();
@@ -1020,6 +1045,7 @@ mod remote_button {
             ))
             .with_handle(menu_handle)
             .menu(move |window, cx| {
+                let default_branch_menu_label = default_branch_menu_label.clone();
                 Some(ContextMenu::build(window, cx, |context_menu, _, _| {
                     context_menu
                         .when_some(keybinding_target.clone(), |el, keybinding_target| {
@@ -1029,6 +1055,9 @@ mod remote_button {
                         .action("Fetch From", git::FetchFrom.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
                         .action("Pull (Rebase)", git::PullRebase.boxed_clone())
+                        .when_some(default_branch_menu_label, |el, label| {
+                            el.action(label, git::PullDefaultBranch.boxed_clone())
+                        })
                         .separator()
                         .action("Push", git::Push.boxed_clone())
                         .action("Push To", git::PushTo.boxed_clone())
@@ -1050,6 +1079,7 @@ mod remote_button {
         behind_count: usize,
         left_icon: Option<IconName>,
         keybinding_target: Option<FocusHandle>,
+        default_branch_menu_label: Option<SharedString>,
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
         left_on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -1121,6 +1151,7 @@ mod remote_button {
         let right = render_git_action_menu(
             format!("split-button-right-{}", id),
             keybinding_target,
+            default_branch_menu_label,
             menu_handle,
         )
         .into_any_element();

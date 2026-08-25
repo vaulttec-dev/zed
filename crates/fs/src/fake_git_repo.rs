@@ -73,6 +73,8 @@ pub struct FakeGitRepositoryState {
     pub simulated_index_write_error_message: Option<String>,
     pub simulated_create_worktree_error: Option<String>,
     pub simulated_graph_error: Option<String>,
+    pub simulated_pull_error: Option<String>,
+    pub simulated_pull_stdout: String,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
@@ -94,6 +96,8 @@ impl FakeGitRepositoryState {
             simulated_index_write_error_message: Default::default(),
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
+            simulated_pull_error: None,
+            simulated_pull_stdout: Default::default(),
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
@@ -1112,7 +1116,15 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        self.with_state_async(false, move |state| {
+            if let Some(error) = &state.simulated_pull_error {
+                anyhow::bail!("{error}");
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: state.simulated_pull_stdout.clone(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn fetch(

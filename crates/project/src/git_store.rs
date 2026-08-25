@@ -7707,7 +7707,7 @@ impl Repository {
         remote: SharedString,
         rebase: bool,
         askpass: AskPassDelegate,
-        _cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
         let askpass_delegates = self.askpass_delegates.clone();
         let askpass_id = util::post_inc(&mut self.latest_askpass_id);
@@ -7722,26 +7722,52 @@ impl Repository {
             status.push_str(&format!(" {}", b));
         }
 
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let this = cx.weak_entity();
+
         self.send_job(
             "pull",
             Some(status.into()),
-            move |git_repo, cx| async move {
+            move |git_repo, mut cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
                         backend,
                         environment,
                         ..
                     }) => {
-                        backend
+                        let result = backend
                             .pull(
                                 branch.as_ref().map(|b| b.to_string()),
                                 remote.to_string(),
                                 rebase,
                                 askpass,
                                 environment.clone(),
-                                cx,
+                                cx.clone(),
                             )
-                            .await
+                            .await;
+                        // Merge details, which record unmerged paths, are only
+                        // recomputed by `compute_snapshot`. Without this the UI
+                        // would not see a conflicted working copy until the file
+                        // watcher happened to trigger a scan. Runs even when the
+                        // command failed, because that is exactly what a merge
+                        // conflict looks like.
+                        if let Some(this) = this.upgrade() {
+                            let snapshot =
+                                compute_snapshot(this, backend.clone(), &mut cx).await;
+                            if let Some(updates_tx) = updates_tx {
+                                updates_tx
+                                    .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                    .ok();
+                            }
+                        }
+                        result
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         askpass_delegates.lock().insert(askpass_id, askpass);

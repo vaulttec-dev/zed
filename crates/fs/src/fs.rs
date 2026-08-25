@@ -2213,6 +2213,14 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_pull_outcome_for_repo(&self, dot_git: &Path, stdout: &str, error: Option<&str>) {
+        self.with_git_state(dot_git, true, |state| {
+            state.simulated_pull_stdout = stdout.to_owned();
+            state.simulated_pull_error = error.map(str::to_owned);
+        })
+        .unwrap();
+    }
+
     pub fn set_index_for_repo(&self, dot_git: &Path, index_state: &[(&str, String)]) {
         self.with_git_state(dot_git, true, |state| {
             state.index_contents.clear();

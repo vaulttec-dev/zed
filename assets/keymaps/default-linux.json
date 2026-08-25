@@ -1059,6 +1059,7 @@
       "ctrl-g up": "git::Push",
       "ctrl-g down": "git::Pull",
       "ctrl-g shift-down": "git::PullRebase",
+      "ctrl-g ctrl-down": "git::PullDefaultBranch",
       "ctrl-g shift-up": "git::ForcePush",
       "ctrl-g d": "git::Diff",
       "ctrl-g backspace": "git::RestoreTrackedFiles",

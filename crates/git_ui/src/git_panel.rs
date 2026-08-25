@@ -11,6 +11,7 @@ use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
+use crate::worktree_service::RemoteBranchName;
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
@@ -89,7 +90,10 @@ use ui::{
     Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
-use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
+use util::{
+    ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath,
+    truncate_and_trailoff,
+};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     Item, Workspace,
@@ -105,6 +109,7 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
+const MAX_BRANCH_NAME_IN_MENU: usize = 24;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -964,6 +969,11 @@ pub struct GitPanel {
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
     changes_actions_menu_handle: PopoverMenuHandle<ContextMenu>,
     remote_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    /// The active repository's default branch, including the remote name when
+    /// one is known (`origin/main`). Resolved asynchronously and cached because
+    /// looking it up shares the repository's job queue with remote operations.
+    default_branch: Option<SharedString>,
+    default_branch_task: Option<Task<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1267,6 +1277,8 @@ impl GitPanel {
                 commit_menu_handle: PopoverMenuHandle::default(),
                 changes_actions_menu_handle: PopoverMenuHandle::default(),
                 remote_action_menu_handle: PopoverMenuHandle::default(),
+                default_branch: None,
+                default_branch_task: None,
             };
 
             this.schedule_update(window, cx);
@@ -3912,6 +3924,137 @@ impl GitPanel {
         .detach_and_log_err(cx);
     }
 
+    pub(crate) fn pull_default_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_push_and_pull(cx) {
+            return;
+        }
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(branch) = repo.read(cx).branch.clone() else {
+            return;
+        };
+        let Some(default_branch_name) = self.default_branch_name() else {
+            self.show_error_toast(
+                "pull",
+                anyhow::anyhow!("Could not determine the default branch of this repository"),
+                cx,
+            );
+            return;
+        };
+        if branch.name() == default_branch_name.as_str() {
+            return;
+        }
+        // Git refuses to merge into a working copy that still has unmerged
+        // paths, so send the user to those conflicts instead of surfacing the
+        // resulting failure as if the new action were broken.
+        if self.active_repo_has_conflicts(cx) {
+            self.show_merge_conflicts(
+                "Resolve the existing conflicts before pulling".into(),
+                window,
+                cx,
+            );
+            return;
+        }
+        if !self.start_remote_operation(RemoteOperationKind::Pull, cx) {
+            return;
+        }
+
+        telemetry::event!("Git Pulled Default Branch");
+        // `origin/main` already names the remote; only a purely local default
+        // branch leaves us having to ask.
+        let known_remote = self.default_remote_branch().map(|default_branch| Remote {
+            name: default_branch.remote_name.into(),
+        });
+        let remote = self.get_remote(false, false, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let _clear_pending_remote_operation = cx.on_drop(&this, |this, cx| {
+                this.clear_remote_operation(cx);
+            });
+
+            let remote = match known_remote {
+                Some(remote) => remote,
+                None => match remote.await {
+                    Ok(Some(remote)) => remote,
+                    Ok(None) => {
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::error!("Failed to get current remote: {}", e);
+                        this.update(cx, |this, cx| this.show_error_toast("pull", e, cx))
+                            .ok();
+                        return Ok(());
+                    }
+                },
+            };
+
+            let askpass = this.update_in(cx, |this, window, cx| {
+                this.askpass_delegate(
+                    format!("git pull {} {}", remote.name, default_branch_name),
+                    window,
+                    cx,
+                )
+            })?;
+
+            let pull = repo.update(cx, |repo, cx| {
+                repo.pull(
+                    Some(default_branch_name.clone()),
+                    remote.name.clone(),
+                    false,
+                    askpass,
+                    cx,
+                )
+            });
+
+            let remote_message = pull.await?;
+
+            let action = RemoteAction::Pull(remote);
+            this.update_in(cx, |this, window, cx| match remote_message {
+                Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
+                Err(e) => {
+                    // A merge that stops on conflicts exits non-zero and reports
+                    // the conflicting paths on stdout, which never reaches the
+                    // error, so the repository state is what tells them apart.
+                    if this.active_repo_has_conflicts(cx) {
+                        this.show_merge_conflicts(
+                            format!("Merge conflicts pulling {default_branch_name}").into(),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        log::error!("Error while pulling default branch {:?}", e);
+                        this.show_error_toast(action.name(), e, cx)
+                    }
+                }
+            })
+            .ok();
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn show_merge_conflicts(
+        &mut self,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+                let toast = StatusToast::new(message, cx, |this, _cx| {
+                    this.icon(
+                        Icon::new(IconName::GitMergeConflict)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                });
+                workspace.toggle_status_toast(toast, cx);
+            })
+            .ok();
+    }
+
     pub(crate) fn push(
         &mut self,
         force_push: bool,
@@ -4521,11 +4664,18 @@ impl GitPanel {
             }
             self.git_access = None;
             self._repo_subscriptions.clear();
+            self.default_branch = None;
+            self.default_branch_task = None;
             if self.active_tab == GitPanelTab::History {
                 self.set_commit_history(CommitHistory::Loading, cx);
             }
         }
         self.active_repository = new_active_repository;
+        // A default branch can appear after the first fetch creates
+        // `refs/remotes/origin/HEAD`, so keep retrying while it is unknown.
+        if self.default_branch.is_none() && self.default_branch_task.is_none() {
+            self.refresh_default_branch(cx);
+        }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
         if self.active_tab == GitPanelTab::History {
@@ -4541,6 +4691,76 @@ impl GitPanel {
                     .ok();
             }
         });
+    }
+
+    fn refresh_default_branch(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            self.default_branch = None;
+            self.default_branch_task = None;
+            return;
+        };
+        let request = repo.update(cx, |repo, _| repo.default_branch(true));
+        self.default_branch_task = Some(cx.spawn(async move |this, cx| {
+            let default_branch = request.await.ok().and_then(Result::ok).flatten();
+            this.update(cx, |this, cx| {
+                this.default_branch_task = None;
+                if this.default_branch != default_branch {
+                    this.default_branch = default_branch;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// The default branch split into its remote and branch parts, or `None`
+    /// when the repository only has a local default branch.
+    fn default_remote_branch(&self) -> Option<RemoteBranchName> {
+        RemoteBranchName::parse(self.default_branch.as_ref()?)
+    }
+
+    /// The default branch's short name, without any remote prefix.
+    fn default_branch_name(&self) -> Option<SharedString> {
+        let default_branch = self.default_branch.as_ref()?;
+        Some(match self.default_remote_branch() {
+            Some(remote_branch) => remote_branch.branch_name.into(),
+            None => default_branch.clone(),
+        })
+    }
+
+    /// Label for the menu entry that merges the default branch into the current
+    /// one, or `None` when that would be a no-op or the default branch is not
+    /// known yet.
+    fn default_branch_menu_label(&self, cx: &App) -> Option<SharedString> {
+        let branch = self.active_repository.as_ref()?.read(cx).branch.as_ref()?;
+        let default_branch_name = self.default_branch_name()?;
+        if branch.name() == default_branch_name.as_str() {
+            return None;
+        }
+        Some(
+            format!(
+                "Pull {} into {}",
+                truncate_and_trailoff(default_branch_name.as_str(), MAX_BRANCH_NAME_IN_MENU),
+                truncate_and_trailoff(branch.name(), MAX_BRANCH_NAME_IN_MENU),
+            )
+            .into(),
+        )
+    }
+
+    fn active_repo_has_conflicts(&self, cx: &App) -> bool {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return false;
+        };
+        let snapshot = repo.read(cx).snapshot();
+        snapshot
+            .merge
+            .merge_heads_by_conflicted_path
+            .iter()
+            .any(|(repo_path, _)| {
+                snapshot
+                    .status_for_path(repo_path)
+                    .is_some_and(|entry| entry.status.is_conflicted())
+            })
     }
 
     fn reopen_commit_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5800,6 +6020,7 @@ impl GitPanel {
         if !self.can_push_and_pull(cx) {
             return None;
         }
+        let default_branch_menu_label = self.default_branch_menu_label(cx);
         Some(
             h_flex()
                 .gap_1()
@@ -5810,6 +6031,7 @@ impl GitPanel {
                     this.children(render_remote_button(
                         "remote-button",
                         &branch,
+                        default_branch_menu_label,
                         focus_handle,
                         true,
                         self.pending_remote_operation,
@@ -11592,6 +11814,144 @@ mod tests {
             panel.clear_remote_operation(cx);
             assert!(panel.pending_remote_operation.is_none());
             assert!(panel.start_remote_operation(RemoteOperationKind::Pull, cx));
+        });
+    }
+
+    async fn init_default_branch_test(
+        branch_name: &str,
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Workspace>,
+        Entity<GitPanel>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked": "tracked\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "tracked\n".into())],
+        );
+        fs.set_branch_name(path!("/project/.git").as_ref(), Some(branch_name));
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        cx.run_until_parked();
+
+        (fs, workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_default_branch_menu_label_hidden_on_default_branch(cx: &mut TestAppContext) {
+        let (_fs, _workspace, panel, mut cx) = init_default_branch_test("main", cx).await;
+
+        panel.update(&mut cx, |panel, cx| {
+            assert_eq!(panel.default_branch.as_deref(), Some("origin/main"));
+            // Merging the default branch into itself is a no-op, so the entry
+            // stays hidden.
+            assert_eq!(panel.default_branch_menu_label(cx), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_default_branch_menu_label_shown_on_feature_branch(cx: &mut TestAppContext) {
+        let (_fs, _workspace, panel, mut cx) = init_default_branch_test("feature/x", cx).await;
+
+        panel.update(&mut cx, |panel, cx| {
+            assert_eq!(
+                panel.default_branch_menu_label(cx).as_deref(),
+                Some("Pull main into feature/x")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pull_default_branch_opens_project_diff_on_conflict(cx: &mut TestAppContext) {
+        let (fs, workspace, panel, mut cx) = init_default_branch_test("feature/x", cx).await;
+
+        // A merge that stops on conflicts exits non-zero and leaves unmerged
+        // paths behind.
+        fs.set_unmerged_paths_for_repo(
+            path!("/project/.git").as_ref(),
+            &[(
+                repo_path("tracked"),
+                UnmergedStatus {
+                    first_head: UnmergedStatusCode::Updated,
+                    second_head: UnmergedStatusCode::Updated,
+                },
+            )],
+        );
+        fs.set_pull_outcome_for_repo(
+            path!("/project/.git").as_ref(),
+            "CONFLICT (content): Merge conflict in tracked\n",
+            Some("Automatic merge failed; fix conflicts and then commit the result."),
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.pull_default_branch(window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, _window, cx| {
+            assert!(
+                workspace.item_of_type::<ProjectDiff>(cx).is_some(),
+                "conflicts should send the user to the diff view"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pull_default_branch_without_conflicts_keeps_diff_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, workspace, panel, mut cx) = init_default_branch_test("feature/x", cx).await;
+
+        fs.set_pull_outcome_for_repo(
+            path!("/project/.git").as_ref(),
+            "Updating a1b2c3d..d4e5f6a\nFast-forward\n 1 file changed, 1 insertion(+)\n",
+            None,
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.pull_default_branch(window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, _window, cx| {
+            assert!(workspace.item_of_type::<ProjectDiff>(cx).is_none());
+        });
+        panel.update(&mut cx, |panel, _cx| {
+            assert!(panel.pending_remote_operation.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pull_default_branch_is_a_noop_on_the_default_branch(cx: &mut TestAppContext) {
+        let (_fs, workspace, panel, mut cx) = init_default_branch_test("main", cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.pull_default_branch(window, cx);
+            assert!(panel.pending_remote_operation.is_none());
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, _window, cx| {
+            assert!(workspace.item_of_type::<ProjectDiff>(cx).is_none());
         });
     }
 
