@@ -397,7 +397,7 @@ async fn transcribe_via_interactions(
 
     let parsed: InteractionsResponse = serde_json::from_str(&response)
         .with_context(|| format!("parsing Interactions response: {response}"))?;
-    non_empty_transcription(parsed.text())
+    non_empty_transcription(parsed.text(), &response)
 }
 
 /// Transcribe with a general-purpose model. Thinking is switched off: it buys
@@ -424,7 +424,7 @@ async fn transcribe_via_generate_content(
 
     let parsed: GenerateContentResponse = serde_json::from_str(&response)
         .with_context(|| format!("parsing Gemini response: {response}"))?;
-    non_empty_transcription(parsed.text())
+    non_empty_transcription(parsed.text(), &response)
 }
 
 fn audio_input_part(audio: &Audio) -> serde_json::Value {
@@ -463,12 +463,27 @@ fn thinking_config(model: &str) -> serde_json::Value {
     }
 }
 
-fn non_empty_transcription(text: Option<String>) -> Result<String> {
+fn non_empty_transcription(text: Option<String>, response: &str) -> Result<String> {
     let trimmed = text.unwrap_or_default().trim().to_string();
     if trimmed.is_empty() {
-        bail!("Gemini returned an empty transcription");
+        // Carry the payload into the message: an unexpected response shape is
+        // otherwise indistinguishable from silence, and diagnosing it would
+        // mean another build just to see what came back.
+        bail!(
+            "Gemini returned an empty transcription. Response: {}",
+            truncate_for_error(response)
+        );
     }
     Ok(trimmed)
+}
+
+/// Trim a payload for an error message without splitting a UTF-8 character.
+fn truncate_for_error(body: &str) -> String {
+    const LIMIT: usize = 400;
+    match body.char_indices().nth(LIMIT) {
+        Some((end, _)) => format!("{}…", &body[..end]),
+        None => body.to_string(),
+    }
 }
 
 async fn post_json(http: &dyn HttpClient, api_key: &str, uri: &str, body: &str) -> Result<String> {
@@ -643,30 +658,44 @@ fn build_prompt(language: &str) -> String {
 
 // ─── Gemini response shapes ──────────────────────────────────────
 
+/// The Interactions API returns the transcription as text blocks inside
+/// `steps[].content[]`. `output_text` is the convenience field the SDKs expose;
+/// it is accepted as a fallback in case the wire format carries it too.
 #[derive(Deserialize)]
 struct InteractionsResponse {
     #[serde(default)]
-    output: Vec<InteractionsOutput>,
+    steps: Vec<InteractionsStep>,
     #[serde(default)]
-    text: Option<String>,
+    output_text: Option<String>,
 }
 
 impl InteractionsResponse {
     fn text(self) -> Option<String> {
-        self.text.or_else(|| {
-            self.output
-                .into_iter()
-                .find_map(|output| output.text.or(output.transcription))
-        })
+        let from_steps = self
+            .steps
+            .into_iter()
+            .flat_map(|step| step.content)
+            .filter_map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if from_steps.trim().is_empty() {
+            self.output_text
+        } else {
+            Some(from_steps)
+        }
     }
 }
 
 #[derive(Deserialize)]
-struct InteractionsOutput {
+struct InteractionsStep {
+    #[serde(default)]
+    content: Vec<InteractionsContent>,
+}
+
+#[derive(Deserialize)]
+struct InteractionsContent {
     #[serde(default)]
     text: Option<String>,
-    #[serde(default)]
-    transcription: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -824,27 +853,80 @@ mod tests {
     }
 
     #[test]
-    fn interactions_response_reads_both_shapes() {
-        let flat: InteractionsResponse =
-            serde_json::from_str(r#"{"text":"привіт"}"#).expect("flat shape parses");
-        assert_eq!(flat.text().as_deref(), Some("привіт"));
+    fn interactions_response_reads_the_documented_shape() {
+        let response = r#"{
+            "id": "int_abc",
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "status": "done",
+                    "content": [{ "type": "text", "text": "привіт" }]
+                }
+            ]
+        }"#;
+        let parsed: InteractionsResponse =
+            serde_json::from_str(response).expect("documented shape parses");
+        assert_eq!(parsed.text().as_deref(), Some("привіт"));
+    }
 
-        let nested: InteractionsResponse =
-            serde_json::from_str(r#"{"output":[{"transcription":"привіт"}]}"#)
-                .expect("nested shape parses");
-        assert_eq!(nested.text().as_deref(), Some("привіт"));
+    #[test]
+    fn interactions_response_joins_multiple_text_blocks() {
+        let response = r#"{
+            "steps": [
+                { "content": [{ "type": "text", "text": "перше" }] },
+                { "content": [{ "type": "text", "text": "друге" }] }
+            ]
+        }"#;
+        let parsed: InteractionsResponse =
+            serde_json::from_str(response).expect("multi-step shape parses");
+        assert_eq!(parsed.text().as_deref(), Some("перше друге"));
+    }
 
-        let empty: InteractionsResponse =
-            serde_json::from_str("{}").expect("empty shape parses");
+    #[test]
+    fn interactions_response_falls_back_to_output_text() {
+        let parsed: InteractionsResponse =
+            serde_json::from_str(r#"{"output_text":"привіт","steps":[]}"#)
+                .expect("output_text shape parses");
+        assert_eq!(parsed.text().as_deref(), Some("привіт"));
+    }
+
+    #[test]
+    fn interactions_response_yields_nothing_when_there_is_no_text() {
+        let empty: InteractionsResponse = serde_json::from_str("{}").expect("empty shape parses");
         assert!(empty.text().is_none());
+
+        let no_text: InteractionsResponse =
+            serde_json::from_str(r#"{"steps":[{"type":"function_call","content":[]}]}"#)
+                .expect("textless step parses");
+        assert!(no_text.text().is_none());
+    }
+
+    #[test]
+    fn empty_transcription_error_carries_the_payload() {
+        let err = non_empty_transcription(None, r#"{"steps":[]}"#)
+            .expect_err("empty transcription is an error");
+        assert!(err.to_string().contains(r#"{"steps":[]}"#));
+    }
+
+    #[test]
+    fn truncate_for_error_does_not_split_characters() {
+        let short = "привіт";
+        assert_eq!(truncate_for_error(short), short);
+
+        let long = "я".repeat(500);
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated.chars().count(), 401);
     }
 
     #[test]
     fn empty_transcription_is_rejected() {
-        assert!(non_empty_transcription(Some("  ".into())).is_err());
-        assert!(non_empty_transcription(None).is_err());
+        assert!(non_empty_transcription(Some("  ".into()), "{}").is_err());
+        assert!(non_empty_transcription(None, "{}").is_err());
         assert_eq!(
-            non_empty_transcription(Some("  привіт  ".into())).expect("non-empty text is kept"),
+            non_empty_transcription(Some("  привіт  ".into()), "{}")
+                .expect("non-empty text is kept"),
             "привіт"
         );
     }
