@@ -16,6 +16,7 @@ use gpui::{
     Window, actions,
 };
 use itertools::Itertools;
+use language_models::DictationSettings;
 use project::{Fs, Project};
 
 use settings::{Settings, TerminalDockPosition};
@@ -86,8 +87,16 @@ pub struct TerminalPanel {
     active: bool,
     /// In-flight voice dictation recording (`Some` while the mic is live).
     dictation: Option<dictation::Recording>,
+    /// Set the instant the mic is clicked and held until ffmpeg is up, so the
+    /// button reflects the click rather than the backend probe behind it.
+    dictation_starting: bool,
     /// True while a recording is being transcribed (shows a spinner).
     dictation_transcribing: bool,
+    /// Started alongside the recording so the stop path never waits on the
+    /// keychain to hand back the Gemini key.
+    dictation_api_key: Option<Task<Option<Arc<str>>>>,
+    /// Holds the in-flight start so a second click can cancel it.
+    dictation_start: Task<()>,
 }
 
 impl TerminalPanel {
@@ -106,7 +115,10 @@ impl TerminalPanel {
             assistant_enabled: false,
             active: false,
             dictation: None,
+            dictation_starting: false,
             dictation_transcribing: false,
+            dictation_api_key: None,
+            dictation_start: Task::ready(()),
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
         terminal_panel
@@ -130,7 +142,7 @@ impl TerminalPanel {
     /// Toggle voice dictation: first click starts recording, second click stops,
     /// transcribes with Gemini, and inserts the text into the active terminal.
     fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dictation.is_some() {
+        if self.dictation.is_some() || self.dictation_starting {
             self.stop_dictation(window, cx);
         } else {
             self.start_dictation(window, cx);
@@ -138,32 +150,53 @@ impl TerminalPanel {
     }
 
     fn start_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Flip the button before awaiting anything: the user times their first
+        // word off the click, so the UI has to agree with them immediately.
+        self.dictation_starting = true;
+        self.refresh_dictation_buttons(cx);
+        // Fetching the key now takes the keychain round trip off the path
+        // between releasing the mic and seeing text.
+        self.dictation_api_key = Some(language_models::google_api_key(cx));
+
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |panel, cx| {
-            match dictation::start_recording().await {
-                Ok(recording) => {
-                    panel
-                        .update(cx, |panel, cx| {
-                            panel.dictation = Some(recording);
-                            panel.refresh_dictation_buttons(cx);
-                        })
-                        .ok();
-                }
-                Err(err) => {
-                    log::error!("dictation: failed to start recording: {err:#}");
-                    workspace
-                        .update(cx, |ws, cx| {
-                            ws.show_error(format!("Voice dictation: {err}"), cx)
-                        })
-                        .ok();
-                }
-            }
-        })
-        .detach();
+        let max_duration = DictationSettings::get_global(cx).max_duration;
+        self.dictation_start = cx.spawn_in(window, async move |panel, cx| {
+            let started = dictation::start_recording(max_duration).await;
+            let failure = panel.update(cx, |panel, cx| {
+                panel.dictation_starting = false;
+                let failure = match started {
+                    Ok(recording) => {
+                        panel.dictation = Some(recording);
+                        None
+                    }
+                    Err(err) => {
+                        panel.dictation_api_key = None;
+                        Some(err)
+                    }
+                };
+                panel.refresh_dictation_buttons(cx);
+                failure
+            });
+            let Some(err) = failure.ok().flatten() else {
+                return;
+            };
+            log::error!("dictation: failed to start recording: {err:#}");
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Voice dictation: {err}"), cx)
+                })
+                .ok();
+        });
     }
 
     fn stop_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recording) = self.dictation.take() else {
+            // Clicked again before ffmpeg was up: drop the pending start, which
+            // kills the process it was about to hand us.
+            self.dictation_start = Task::ready(());
+            self.dictation_starting = false;
+            self.dictation_api_key = None;
+            self.refresh_dictation_buttons(cx);
             return;
         };
         // Show the spinner while transcription runs in the background.
@@ -176,17 +209,24 @@ impl TerminalPanel {
             self.refresh_dictation_buttons(cx);
             return;
         };
-        let api_key_task = language_models::google_api_key(cx);
-        // Default to Ukrainian for accurate recognition; override with
-        // ZED_DICTATION_LANG (e.g. "en", "de", or "auto" to let Gemini detect).
-        let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
+        let api_key_task = self
+            .dictation_api_key
+            .take()
+            .unwrap_or_else(|| language_models::google_api_key(cx));
+        let settings = DictationSettings::get_global(cx);
+        let model = settings.model.clone();
+        let language = settings.language.clone();
 
         cx.spawn_in(window, async move |panel, cx| {
             let result: Result<String> = async {
                 let wav = dictation::stop_recording(recording).await?;
-                let api_key = api_key_task.await.map(|key| key.to_string()).unwrap_or_default();
+                let api_key = api_key_task
+                    .await
+                    .map(|key| key.to_string())
+                    .unwrap_or_default();
                 let text =
-                    dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
+                    dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &model, &language)
+                        .await;
                 dictation::cleanup(&wav);
                 text
             }
@@ -249,7 +289,7 @@ impl TerminalPanel {
     ) {
         let assistant_enabled = self.assistant_enabled;
         let dictation_panel = cx.weak_entity();
-        let dictation_recording = self.dictation.is_some();
+        let dictation_recording = self.dictation.is_some() || self.dictation_starting;
         let dictation_transcribing = self.dictation_transcribing;
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {

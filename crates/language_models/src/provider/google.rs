@@ -19,8 +19,9 @@ use language_model::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 pub use settings::GoogleAvailableModel as AvailableModel;
-use settings::{Settings, SettingsStore};
+use settings::{RegisterSetting, Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use strum::IntoEnumIterator;
 use ui::IconName;
 
@@ -123,6 +124,39 @@ pub fn google_api_key(cx: &mut App) -> Task<Option<Arc<str>>> {
         load.await.ok();
         cx.update(|cx| state.read(cx).current_key(cx))
     })
+}
+
+/// Voice dictation settings. They live next to [`google_api_key`] because
+/// dictation is a non-LLM feature that nonetheless runs on the Gemini key and
+/// model ids configured for this provider.
+#[derive(Clone, Debug, PartialEq, Eq, RegisterSetting)]
+pub struct DictationSettings {
+    pub model: SharedString,
+    pub language: SharedString,
+    pub max_duration: Duration,
+}
+
+impl Settings for DictationSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let defaults = settings::DictationSettingsContent::default();
+        let dictation = content.dictation.clone().unwrap_or_else(|| defaults.clone());
+        let pick = |value: Option<String>, fallback: &Option<String>| -> SharedString {
+            value
+                .or_else(|| fallback.clone())
+                .unwrap_or_default()
+                .into()
+        };
+        DictationSettings {
+            model: pick(dictation.model, &defaults.model),
+            language: pick(dictation.language, &defaults.language),
+            max_duration: Duration::from_secs(
+                dictation
+                    .max_duration_seconds
+                    .or(defaults.max_duration_seconds)
+                    .unwrap_or_default(),
+            ),
+        }
+    }
 }
 
 impl GoogleLanguageModelProvider {

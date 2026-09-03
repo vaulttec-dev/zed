@@ -20,7 +20,7 @@ use crate::provider::bedrock::BedrockLanguageModelProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
 use crate::provider::google::GoogleLanguageModelProvider;
-pub use crate::provider::google::google_api_key;
+pub use crate::provider::google::{DictationSettings, google_api_key};
 use crate::provider::llama_cpp::LlamaCppLanguageModelProvider;
 use crate::provider::lmstudio::LmStudioLanguageModelProvider;
 pub use crate::provider::mistral::MistralLanguageModelProvider;

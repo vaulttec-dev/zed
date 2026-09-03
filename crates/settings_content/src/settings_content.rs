@@ -176,6 +176,9 @@ pub struct SettingsContent {
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
 
+    /// Configuration of voice dictation in Zed.
+    pub dictation: Option<DictationSettingsContent>,
+
     /// Whether or not to automatically check for updates.
     ///
     /// Default: true
@@ -496,6 +499,37 @@ impl strum::VariantNames for BaseKeymapContent {
         "Cursor",
         "None",
     ];
+}
+
+/// Configuration of voice dictation in Zed.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct DictationSettingsContent {
+    /// Gemini model used to transcribe recordings. Ids containing
+    /// `transcribe` are dedicated speech-to-text models and are sent over the
+    /// Interactions API; anything else is treated as a general-purpose model.
+    ///
+    /// Default: gemini-3.5-transcribe
+    pub model: Option<String>,
+    /// Language spoken when dictating, as a code such as `uk` or `en`.
+    /// `auto` lets the model detect it.
+    ///
+    /// Default: uk
+    pub language: Option<String>,
+    /// Longest a single recording may run before it stops on its own.
+    ///
+    /// Default: 300
+    pub max_duration_seconds: Option<u64>,
+}
+
+impl Default for DictationSettingsContent {
+    fn default() -> Self {
+        Self {
+            model: Some("gemini-3.5-transcribe".to_string()),
+            language: Some("uk".to_string()),
+            max_duration_seconds: Some(300),
+        }
+    }
 }
 
 /// Configuration of audio in Zed.

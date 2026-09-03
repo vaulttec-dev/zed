@@ -80,6 +80,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
+use language_models::DictationSettings;
 use notifications::status_toast::StatusToast;
 use project::{Project, ProjectPath, Worktree};
 use settings::TerminalDockPosition;
@@ -1189,8 +1190,16 @@ pub struct AgentPanel {
     is_active: bool,
     /// In-flight voice dictation recording for the agent-panel terminal.
     dictation: Option<dictation::Recording>,
+    /// Set the instant the mic is clicked and held until ffmpeg is up, so the
+    /// button reflects the click rather than the backend probe behind it.
+    dictation_starting: bool,
     /// True while a recording is being transcribed (shows a spinner).
     dictation_transcribing: bool,
+    /// Started alongside the recording so the stop path never waits on the
+    /// keychain to hand back the Gemini key.
+    dictation_api_key: Option<Task<Option<Arc<str>>>>,
+    /// Holds the in-flight start so a second click can cancel it.
+    dictation_start: Task<()>,
 }
 
 impl AgentPanel {
@@ -1595,7 +1604,10 @@ impl AgentPanel {
             last_context_source: None,
             is_active: false,
             dictation: None,
+            dictation_starting: false,
             dictation_transcribing: false,
+            dictation_api_key: None,
+            dictation_start: Task::ready(()),
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -4003,7 +4015,7 @@ impl AgentPanel {
                 .with_rotate_animation(2)
                 .into_any_element();
         }
-        let recording = self.dictation.is_some();
+        let recording = self.dictation.is_some() || self.dictation_starting;
         let (icon, tip, color) = if recording {
             (IconName::Stop, "Stop dictation & insert", Color::Error)
         } else {
@@ -4018,7 +4030,7 @@ impl AgentPanel {
     }
 
     fn toggle_dictation(&mut self, cx: &mut Context<Self>) {
-        if self.dictation.is_some() {
+        if self.dictation.is_some() || self.dictation_starting {
             self.stop_dictation(cx);
         } else {
             self.start_dictation(cx);
@@ -4026,48 +4038,87 @@ impl AgentPanel {
     }
 
     fn start_dictation(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            match dictation::start_recording().await {
-                Ok(recording) => {
-                    this.update(cx, |this, cx| {
+        // Flip the button before awaiting anything: the user times their first
+        // word off the click, so the UI has to agree with them immediately.
+        self.dictation_starting = true;
+        cx.notify();
+        // Fetching the key now takes the keychain round trip off the path
+        // between releasing the mic and seeing text.
+        self.dictation_api_key = Some(language_models::google_api_key(cx));
+
+        let workspace = self.workspace.clone();
+        let max_duration = DictationSettings::get_global(cx).max_duration;
+        self.dictation_start = cx.spawn(async move |this, cx| {
+            let started = dictation::start_recording(max_duration).await;
+            let failure = this.update(cx, |this, cx| {
+                this.dictation_starting = false;
+                let failure = match started {
+                    Ok(recording) => {
                         this.dictation = Some(recording);
-                        cx.notify();
-                    })
-                    .ok();
-                }
-                Err(err) => {
-                    log::error!("dictation: failed to start recording: {err:#}");
-                }
-            }
-        })
-        .detach();
+                        None
+                    }
+                    Err(err) => {
+                        this.dictation_api_key = None;
+                        Some(err)
+                    }
+                };
+                cx.notify();
+                failure
+            });
+            let Some(err) = failure.ok().flatten() else {
+                return;
+            };
+            log::error!("dictation: failed to start recording: {err:#}");
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Voice dictation: {err}"), cx)
+                })
+                .ok();
+        });
     }
 
     fn stop_dictation(&mut self, cx: &mut Context<Self>) {
         let Some(recording) = self.dictation.take() else {
+            // Clicked again before ffmpeg was up: drop the pending start, which
+            // kills the process it was about to hand us.
+            self.dictation_start = Task::ready(());
+            self.dictation_starting = false;
+            self.dictation_api_key = None;
+            cx.notify();
             return;
         };
         // Show the spinner while transcription runs in the background.
         self.dictation_transcribing = true;
         cx.notify();
 
+        let workspace = self.workspace.clone();
         let http = self.project.read(cx).client().http_client();
-        let api_key_task = language_models::google_api_key(cx);
-        let language = std::env::var("ZED_DICTATION_LANG").unwrap_or_else(|_| "uk".to_string());
+        let api_key_task = self
+            .dictation_api_key
+            .take()
+            .unwrap_or_else(|| language_models::google_api_key(cx));
+        let settings = DictationSettings::get_global(cx);
+        let model = settings.model.clone();
+        let language = settings.language.clone();
 
         cx.spawn(async move |this, cx| {
             let result: anyhow::Result<String> = async {
                 let wav = dictation::stop_recording(recording).await?;
-                let api_key = api_key_task.await.map(|key| key.to_string()).unwrap_or_default();
-                let text = dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &language).await;
+                let api_key = api_key_task
+                    .await
+                    .map(|key| key.to_string())
+                    .unwrap_or_default();
+                let text =
+                    dictation::transcribe_wav(http.as_ref(), &api_key, &wav, &model, &language)
+                        .await;
                 dictation::cleanup(&wav);
                 text
             }
             .await;
 
-            this.update(cx, |this, cx| {
+            let failure = this.update(cx, |this, cx| {
                 this.dictation_transcribing = false;
-                match result {
+                let failure = match result {
                     Ok(text) => {
                         if let Some(terminal_view) = this.visible_terminal_view().cloned() {
                             let terminal = terminal_view.read(cx).terminal().clone();
@@ -4075,14 +4126,22 @@ impl AgentPanel {
                                 terminal.input(text.into_bytes());
                             });
                         }
+                        None
                     }
-                    Err(err) => {
-                        log::error!("dictation: {err:#}");
-                    }
-                }
+                    Err(err) => Some(err),
+                };
                 cx.notify();
-            })
-            .ok();
+                failure
+            });
+            let Some(err) = failure.ok().flatten() else {
+                return;
+            };
+            log::error!("dictation: {err:#}");
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Voice dictation: {err}"), cx)
+                })
+                .ok();
         })
         .detach();
     }
