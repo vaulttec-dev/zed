@@ -1,0 +1,41 @@
+crates/git_ui/src/git_panel.rs
+  s_97c3de848cb74a::t_759d924ff6134d 5846
+  s_97c3de848cb74a::t_4063c93c4ba3bd 41-42,2779-2791,2793,2802-2830,2838,2848,2881,4108,4184,5803,5836-5845,5847-5851,6369,8453
+  s_97c3de848cb74a::t_1b9e5bebfefb9c 40
+docs/src/git.md
+  s_97c3de848cb74a::t_8e166cf523aadb 377,380
+crates/git/src/repository.rs
+  s_97c3de848cb74a::t_6ba781d3d9fc9b 461,1066,2566-2569,2606,2634,5044-5181
+  s_97c3de848cb74a::t_bf712c0c7154ae 5182-5183
+crates/project/src/git_store.rs
+  s_97c3de848cb74a::t_cdce66ff7ecc98 7618-7622,7636
+  s_97c3de848cb74a::t_ca585d309ca023 2880,2892,3130,7535,7600,7608-7617,7650,7699
+crates/git_ui/src/commit_modal.rs
+  s_97c3de848cb74a::t_ca585d309ca023 11-12
+  s_97c3de848cb74a::t_759d924ff6134d 287-288
+  s_97c3de848cb74a::t_257027aefeacf6 331-344,474,522-534,537,625
+crates/fs/src/fake_git_repo.rs
+  s_97c3de848cb74a::t_9115032ba00b24 1103
+crates/git/src/git.rs
+  s_97c3de848cb74a::t_1b5cfefe52ac0f 93-94,107-108
+crates/git_ui/src/git_ui.rs
+  s_97c3de848cb74a::t_a30801ca331814 196,204,212-220,1073
+crates/proto/proto/git.proto
+  s_97c3de848cb74a::t_aad9484c445f39 416,435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "49188a90e8f85fe9e26f6ea9c28dd446cc3f68d8",
+  "prompts": {},
+  "sessions": {
+    "s_97c3de848cb74a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4774d753-9a94-466f-a412-23c129a89d2d",
+        "model": "claude-opus-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
