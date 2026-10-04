@@ -193,7 +193,7 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 panel.update(cx, |panel, cx| {
-                    panel.push(false, false, window, cx);
+                    panel.push(false, false, false, window, cx);
                 });
             });
             workspace.register_action(|workspace, _: &git::PushTo, window, cx| {
@@ -201,7 +201,7 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 panel.update(cx, |panel, cx| {
-                    panel.push(false, true, window, cx);
+                    panel.push(false, true, false, window, cx);
                 });
             });
             workspace.register_action(|workspace, _: &git::ForcePush, window, cx| {
@@ -209,7 +209,15 @@ pub fn init(cx: &mut App) {
                     return;
                 };
                 panel.update(cx, |panel, cx| {
-                    panel.push(true, false, window, cx);
+                    panel.push(true, false, false, window, cx);
+                });
+            });
+            workspace.register_action(|workspace, _: &git::PushNoVerify, window, cx| {
+                let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.push(false, false, true, window, cx);
                 });
             });
             workspace.register_action(|workspace, _: &git::Pull, window, cx| {
@@ -1062,6 +1070,7 @@ mod remote_button {
                         .action("Push", git::Push.boxed_clone())
                         .action("Push To", git::PushTo.boxed_clone())
                         .action("Force Push", git::ForcePush.boxed_clone())
+                        .action("Push (No Verify)", git::PushNoVerify.boxed_clone())
                 }))
             })
             .anchor(Anchor::TopRight)

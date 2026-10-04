@@ -37,7 +37,9 @@ use git::repository::{
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
-use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
+use git::{
+    Amend, Commit, CommitNoVerify, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus,
+};
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
     StashAll, StashApply, StashPop, ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll,
@@ -2774,14 +2776,56 @@ impl GitPanel {
     }
 
     fn on_commit(&mut self, _: &Commit, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_action(false, window, cx);
+    }
+
+    fn on_commit_no_verify(
+        &mut self,
+        _: &CommitNoVerify,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_action(true, window, cx);
+    }
+
+    fn commit_action(&mut self, no_verify: bool, window: &mut Window, cx: &mut Context<Self>) {
         let is_amend = self.amend_pending;
-        if self.commit(&self.commit_editor.focus_handle(cx), window, cx) {
+        if self.commit(&self.commit_editor.focus_handle(cx), no_verify, window, cx) {
             if is_amend {
                 telemetry::event!("Git Amended", source = "Git Panel");
             } else {
                 telemetry::event!("Git Committed", source = "Git Panel");
             }
         }
+    }
+
+    /// Commits using the panel's current amend/signoff state, without requiring
+    /// the commit editor to be focused. Used by the commit button and its menu,
+    /// which can be clicked while focus is elsewhere.
+    pub(crate) fn commit_from_button(
+        &mut self,
+        no_verify: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.configure_commit_button(cx).0 {
+            return;
+        }
+        if self.amend_pending {
+            telemetry::event!("Git Amended", source = "Git Panel");
+        } else {
+            telemetry::event!("Git Committed", source = "Git Panel");
+        }
+        self.commit_changes(
+            CommitOptions {
+                amend: self.amend_pending,
+                signoff: self.signoff_enabled,
+                allow_empty: false,
+                no_verify,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Commits staged changes with the current commit message.
@@ -2791,6 +2835,7 @@ impl GitPanel {
     pub(crate) fn commit(
         &mut self,
         commit_editor_focus_handle: &FocusHandle,
+        no_verify: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -2800,6 +2845,7 @@ impl GitPanel {
                     amend: self.amend_pending,
                     signoff: self.signoff_enabled,
                     allow_empty: false,
+                    no_verify,
                 },
                 window,
                 cx,
@@ -2832,7 +2878,7 @@ impl GitPanel {
                 if !self.amend_pending {
                     self.toggle_amend_pending(cx);
                 } else {
-                    return self.commit(commit_editor_focus_handle, window, cx);
+                    return self.commit(commit_editor_focus_handle, false, window, cx);
                 }
             }
             false
@@ -4059,6 +4105,7 @@ impl GitPanel {
         &mut self,
         force_push: bool,
         select_remote: bool,
+        no_verify: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4134,6 +4181,7 @@ impl GitPanel {
                         .into(),
                     remote.name.clone(),
                     options,
+                    no_verify,
                     askpass_delegate,
                     cx,
                 )
@@ -5752,6 +5800,7 @@ impl GitPanel {
                 let has_previous_commit = self.head_commit(cx).is_some();
                 let amend = self.amend_pending();
                 let signoff = self.signoff_enabled;
+                let can_commit = self.configure_commit_button(cx).0;
 
                 move |window, cx| {
                     Some(ContextMenu::build(window, cx, |context_menu, _, _| {
@@ -5783,6 +5832,22 @@ impl GitPanel {
                                 IconPosition::Start,
                                 Some(Box::new(Signoff)),
                                 move |window, cx| window.dispatch_action(Box::new(Signoff), cx),
+                            )
+                            .separator()
+                            .item(
+                                ContextMenuEntry::new("Commit (No Verify)")
+                                    .action(Box::new(CommitNoVerify))
+                                    .disabled(!can_commit)
+                                    .handler({
+                                        let git_panel = git_panel.downgrade();
+                                        move |window, cx| {
+                                            git_panel
+                                                .update(cx, |git_panel, cx| {
+                                                    git_panel.commit_from_button(true, window, cx);
+                                                })
+                                                .ok();
+                                        }
+                                    }),
                             )
                     }))
                 }
@@ -6301,6 +6366,7 @@ impl GitPanel {
                                             amend,
                                             signoff,
                                             allow_empty: false,
+                                            no_verify: false,
                                         },
                                         window,
                                         cx,
@@ -8384,6 +8450,7 @@ impl Render for GitPanel {
                 this.on_action(cx.listener(Self::toggle_staged_for_selected))
                     .on_action(cx.listener(Self::stage_range))
                     .on_action(cx.listener(GitPanel::on_commit))
+                    .on_action(cx.listener(GitPanel::on_commit_no_verify))
                     .on_action(cx.listener(GitPanel::on_amend))
                     .on_action(cx.listener(GitPanel::toggle_signoff_enabled))
                     .on_action(cx.listener(Self::stage_all))

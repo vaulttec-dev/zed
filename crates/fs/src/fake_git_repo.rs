@@ -1100,6 +1100,7 @@ impl GitRepository for FakeGitRepository {
         _remote_branch: String,
         _remote: String,
         _options: Option<PushOptions>,
+        _no_verify: bool,
         _askpass: AskPassDelegate,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,

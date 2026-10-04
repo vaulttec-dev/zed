@@ -90,6 +90,8 @@ actions!(
         PushTo,
         /// Force pushes commits to the remote repository.
         ForcePush,
+        /// Pushes commits to the remote repository, skipping git hooks.
+        PushNoVerify,
         /// Pulls changes from the remote repository.
         Pull,
         /// Pulls changes from the remote repository with rebase.
@@ -102,6 +104,8 @@ actions!(
         FetchFrom,
         /// Creates a new commit with staged changes.
         Commit,
+        /// Creates a new commit with staged changes, skipping git hooks.
+        CommitNoVerify,
         /// Amends the last commit with staged changes.
         Amend,
         /// Enable the --signoff option.

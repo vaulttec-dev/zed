@@ -458,6 +458,7 @@ pub struct CommitOptions {
     pub amend: bool,
     pub signoff: bool,
     pub allow_empty: bool,
+    pub no_verify: bool,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -1062,6 +1063,7 @@ pub trait GitRepository: Send + Sync {
         remote_branch_name: String,
         upstream_name: String,
         options: Option<PushOptions>,
+        no_verify: bool,
         askpass: AskPassDelegate,
         env: Arc<HashMap<String, String>>,
         // This method takes an AsyncApp to ensure it's invoked on the main thread,
@@ -2561,6 +2563,10 @@ impl GitRepository for RealGitRepository {
                 cmd.arg("--allow-empty");
             }
 
+            if options.no_verify {
+                cmd.arg("--no-verify");
+            }
+
             if let Some((name, email)) = name_and_email {
                 cmd.arg("--author").arg(&format!("{name} <{email}>"));
             }
@@ -2597,6 +2603,7 @@ impl GitRepository for RealGitRepository {
         remote_branch_name: String,
         remote_name: String,
         options: Option<PushOptions>,
+        no_verify: bool,
         ask_pass: AskPassDelegate,
         env: Arc<HashMap<String, String>>,
         cx: AsyncApp,
@@ -2624,6 +2631,7 @@ impl GitRepository for RealGitRepository {
                     PushOptions::SetUpstream => "--set-upstream",
                     PushOptions::Force => "--force-with-lease",
                 }))
+                .args(no_verify.then_some("--no-verify"))
                 .arg(remote_name)
                 .arg(format!("{}:{}", branch_name, remote_branch_name))
                 .stdin(Stdio::null())
@@ -5031,6 +5039,146 @@ mod tests {
 
         let message = git_command_output(repo_dir.path(), ["log", "-1", "--pretty=%B"]);
         assert_eq!(message, "rewritten by commit-msg hook");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_no_verify_skips_git_hooks(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote_directory = temp_dir.path().join("remote.git");
+        git_command(
+            temp_dir.path(),
+            [
+                OsString::from("init"),
+                OsString::from("--bare"),
+                OsString::from("-b"),
+                OsString::from("main"),
+                remote_directory.as_os_str().into(),
+            ],
+        );
+
+        let repo_dir = temp_dir.path().join("repo");
+        git_init_repo(&repo_dir);
+        git_command(
+            &repo_dir,
+            [
+                OsString::from("remote"),
+                OsString::from("add"),
+                OsString::from("origin"),
+                remote_directory.as_os_str().into(),
+            ],
+        );
+
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        repo.set_trusted(true);
+
+        let hooks_dir = repo_dir.join(".git").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let write_hook = |name: &str, contents: &str| {
+            let path = hooks_dir.join(name);
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_hook(
+            "pre-commit",
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/pre-commit-ran\"\necho 'pre-commit hook rejected the commit' >&2\nexit 1\n",
+        );
+        write_hook(
+            "pre-push",
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/pre-push-ran\"\necho 'pre-push hook rejected the push' >&2\nexit 1\n",
+        );
+
+        fs::write(repo_dir.join("file"), "one").unwrap();
+        repo.stage_paths(vec![repo_path("file")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+
+        let error = repo
+            .commit(
+                "Commit blocked by hook".into(),
+                None,
+                CommitOptions::default(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(test_commit_envs()),
+            )
+            .await
+            .expect_err("failing pre-commit hook should abort the commit");
+        assert!(
+            error.to_string().contains("pre-commit hook rejected"),
+            "commit should fail because of the hook, got: {error:#}"
+        );
+        assert!(hooks_dir.join("pre-commit-ran").exists());
+        fs::remove_file(hooks_dir.join("pre-commit-ran")).unwrap();
+
+        repo.commit(
+            "Commit skipping hooks".into(),
+            None,
+            CommitOptions {
+                no_verify: true,
+                ..Default::default()
+            },
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .expect("--no-verify should skip the failing pre-commit hook");
+        assert!(
+            !hooks_dir.join("pre-commit-ran").exists(),
+            "--no-verify should not have run the pre-commit hook"
+        );
+
+        let error = repo
+            .push(
+                "main".to_string(),
+                "main".to_string(),
+                "origin".to_string(),
+                Some(PushOptions::SetUpstream),
+                false,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(test_commit_envs()),
+                cx.to_async(),
+            )
+            .await
+            .expect_err("failing pre-push hook should abort the push");
+        assert!(
+            error.to_string().contains("pre-push hook rejected"),
+            "push should fail because of the hook, got: {error:#}"
+        );
+        assert!(hooks_dir.join("pre-push-ran").exists());
+        fs::remove_file(hooks_dir.join("pre-push-ran")).unwrap();
+
+        repo.push(
+            "main".to_string(),
+            "main".to_string(),
+            "origin".to_string(),
+            Some(PushOptions::SetUpstream),
+            true,
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .expect("--no-verify should skip the failing pre-push hook");
+        assert!(
+            !hooks_dir.join("pre-push-ran").exists(),
+            "--no-verify should not have run the pre-push hook"
+        );
+
+        assert_eq!(
+            git_command_output(&remote_directory, ["log", "-1", "--pretty=%B", "main"]),
+            "Commit skipping hooks"
+        );
     }
 
     #[gpui::test]

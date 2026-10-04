@@ -2877,6 +2877,7 @@ impl GitStore {
                 proto::push::PushOptions::Force => git::repository::PushOptions::Force,
             });
 
+        let no_verify = envelope.payload.no_verify;
         let branch_name = envelope.payload.branch_name.into();
         let remote_branch_name = envelope.payload.remote_branch_name.into();
         let remote_name = envelope.payload.remote_name.into();
@@ -2888,6 +2889,7 @@ impl GitStore {
                     remote_branch_name,
                     remote_name,
                     options,
+                    no_verify,
                     askpass,
                     cx,
                 )
@@ -3125,6 +3127,7 @@ impl GitStore {
                         amend: options.amend,
                         signoff: options.signoff,
                         allow_empty: options.allow_empty,
+                        no_verify: options.no_verify,
                     },
                     askpass,
                     cx,
@@ -7529,6 +7532,7 @@ impl Repository {
                                     amend: options.amend,
                                     signoff: options.signoff,
                                     allow_empty: options.allow_empty,
+                                    no_verify: options.no_verify,
                                 }),
                                 askpass_id,
                             })
@@ -7593,6 +7597,7 @@ impl Repository {
         remote_branch: SharedString,
         remote: SharedString,
         options: Option<PushOptions>,
+        no_verify: bool,
         askpass: AskPassDelegate,
         cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
@@ -7600,12 +7605,21 @@ impl Repository {
         let askpass_id = util::post_inc(&mut self.latest_askpass_id);
         let id = self.id;
 
-        let args = options
-            .map(|option| match option {
-                PushOptions::SetUpstream => " --set-upstream",
-                PushOptions::Force => " --force-with-lease",
-            })
-            .unwrap_or("");
+        let mut args = Vec::new();
+        match options {
+            Some(PushOptions::SetUpstream) => args.push("--set-upstream"),
+            Some(PushOptions::Force) => args.push("--force-with-lease"),
+            None => {}
+        }
+        if no_verify {
+            args.push("--no-verify");
+        }
+        let args = args.join(" ");
+        let push_command = if args.is_empty() {
+            format!("git push {} {}:{}", remote, branch, remote_branch)
+        } else {
+            format!("git push {} {} {}:{}", args, remote, branch, remote_branch)
+        };
 
         let updates_tx = self
             .git_store()
@@ -7619,7 +7633,7 @@ impl Repository {
         let this = cx.weak_entity();
         self.send_job(
             "push",
-            Some(format!("git push {} {} {}:{}", args, remote, branch, remote_branch).into()),
+            Some(push_command.into()),
             move |git_repo, mut cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
@@ -7633,6 +7647,7 @@ impl Repository {
                                 remote_branch.to_string(),
                                 remote.to_string(),
                                 options,
+                                no_verify,
                                 askpass,
                                 environment.clone(),
                                 cx.clone(),
@@ -7681,6 +7696,7 @@ impl Repository {
                                 branch_name: branch.to_string(),
                                 remote_branch_name: remote_branch.to_string(),
                                 remote_name: remote.to_string(),
+                                no_verify,
                                 options: options.map(|options| match options {
                                     PushOptions::Force => proto::push::PushOptions::Force,
                                     PushOptions::SetUpstream => {

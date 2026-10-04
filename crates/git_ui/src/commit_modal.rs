@@ -8,8 +8,8 @@ use git::{Amend, Commit, GenerateCommitMessage, Signoff};
 use project::DisableAiSettings;
 use settings::Settings;
 use ui::{
-    ButtonLike, ContextMenu, ElevationIndex, KeybindingHint, PopoverMenu, PopoverMenuHandle,
-    SplitButton, Tooltip, prelude::*,
+    ButtonLike, ContextMenu, ContextMenuEntry, ElevationIndex, KeybindingHint, PopoverMenu,
+    PopoverMenuHandle, SplitButton, Tooltip, prelude::*,
 };
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
@@ -284,6 +284,8 @@ impl CommitModal {
             .menu({
                 let git_panel_entity = self.git_panel.clone();
                 move |window, cx| {
+                    let can_commit = git_panel_entity
+                        .update(cx, |git_panel, cx| git_panel.configure_commit_button(cx).0);
                     let git_panel = git_panel_entity.read(cx);
                     let amend_enabled = git_panel.amend_pending();
                     let signoff_enabled = git_panel.signoff_enabled();
@@ -325,6 +327,20 @@ impl CommitModal {
                                         })
                                     }
                                 },
+                            )
+                            .separator()
+                            .item(
+                                ContextMenuEntry::new("Commit (No Verify)")
+                                    .action(Box::new(git::CommitNoVerify))
+                                    .disabled(!can_commit)
+                                    .handler({
+                                        let git_panel = git_panel_entity.clone();
+                                        move |window, cx| {
+                                            git_panel.update(cx, |git_panel, cx| {
+                                                git_panel.commit_from_button(true, window, cx);
+                                            });
+                                        }
+                                    }),
                             )
                     }))
                 }
@@ -455,6 +471,7 @@ impl CommitModal {
                                             amend: is_amend_pending,
                                             signoff: is_signoff_enabled,
                                             allow_empty: false,
+                                            no_verify: false,
                                         },
                                         window,
                                         cx,
@@ -502,9 +519,22 @@ impl CommitModal {
     }
 
     fn on_commit(&mut self, _: &git::Commit, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_action(false, window, cx);
+    }
+
+    fn on_commit_no_verify(
+        &mut self,
+        _: &git::CommitNoVerify,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_action(true, window, cx);
+    }
+
+    fn commit_action(&mut self, no_verify: bool, window: &mut Window, cx: &mut Context<Self>) {
         let is_amend = self.git_panel.read(cx).amend_pending();
         let did_execute = self.git_panel.update(cx, |git_panel, cx| {
-            git_panel.commit(&self.commit_editor.focus_handle(cx), window, cx)
+            git_panel.commit(&self.commit_editor.focus_handle(cx), no_verify, window, cx)
         });
         if did_execute {
             if is_amend {
@@ -592,6 +622,7 @@ impl Render for CommitModal {
             .key_context("GitCommit")
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::on_commit))
+            .on_action(cx.listener(Self::on_commit_no_verify))
             .on_action(cx.listener(Self::on_amend))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))

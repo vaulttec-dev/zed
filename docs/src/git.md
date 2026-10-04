@@ -374,8 +374,10 @@ When viewing files with changes, Zed displays diff hunks that can be expanded or
 | {#action git::StageAndNext}               | {#kb git::StageAndNext}               |
 | {#action git::UnstageAndNext}             | {#kb git::UnstageAndNext}             |
 | {#action git::Commit}                     | {#kb git::Commit}                     |
+| {#action git::CommitNoVerify}             | {#kb git::CommitNoVerify}             |
 | {#action git::ExpandCommitEditor}         | {#kb git::ExpandCommitEditor}         |
 | {#action git::Push}                       | {#kb git::Push}                       |
+| {#action git::PushNoVerify}               | {#kb git::PushNoVerify}               |
 | {#action git::ForcePush}                  | {#kb git::ForcePush}                  |
 | {#action git::Pull}                       | {#kb git::Pull}                       |
 | {#action git::PullRebase}                 | {#kb git::PullRebase}                 |
