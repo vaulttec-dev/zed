@@ -47,6 +47,41 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+const REMOTE_SERVER_PATH_ENV: &str = "ZED_REMOTE_SERVER_PATH";
+
+/// Looks for a remote server archive that ships with this build instead of one served by
+/// the release API. Builds whose version is not published upstream have no asset to fetch,
+/// so without a local archive every remote connection fails with a 404 from the API.
+///
+/// The archive is handed to the transports as-is: they upload it and unpack it on the
+/// remote, so it must stay compressed (`.gz`, or `.zip` for Windows remotes), exactly as
+/// `script/bundle-linux` produces it.
+async fn bundled_remote_server_archive(os: &str, arch: &str) -> Option<PathBuf> {
+    let extension = if os == "windows" { "zip" } else { "gz" };
+    let file_name = format!("zed-remote-server-{os}-{arch}.{extension}");
+
+    let mut candidates = Vec::new();
+    if let Some(configured_path) = env::var_os(REMOTE_SERVER_PATH_ENV) {
+        let configured_path = PathBuf::from(configured_path);
+        candidates.push(configured_path.join(&file_name));
+        candidates.push(configured_path);
+    }
+    if let Ok(executable_path) = env::current_exe()
+        && let Some(executable_dir) = executable_path.parent()
+    {
+        candidates.push(executable_dir.join(&file_name));
+    }
+    candidates.push(remote_servers_dir().join(&file_name));
+
+    for candidate in candidates {
+        if let Ok(metadata) = smol::fs::metadata(&candidate).await
+            && metadata.is_file()
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -569,6 +604,15 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
+        if let Some(bundled_path) = bundled_remote_server_archive(os, arch).await {
+            log::info!(
+                "using bundled remote server archive at {}",
+                bundled_path.display()
+            );
+            set_status("Using bundled remote server", cx);
+            return Ok(bundled_path);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -625,6 +669,13 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        // Returning `None` makes the transports fall back to
+        // `download_remote_server_release`, which serves the bundled archive. Asking the
+        // release API here instead would abort the connection before that fallback runs.
+        if bundled_remote_server_archive(os, arch).await.is_some() {
+            return Ok(None);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0

@@ -195,13 +195,17 @@ chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 # Copy generated licenses so they'll end up in archive too
 cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
-# Create archive out of everything that's in the temp directory
 arch=$(uname -m)
+
+# Remote server. The copy next to zed-editor is what the app uploads to a remote host, so
+# it has to be in place before the tarball is created.
+gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+cp "${target_dir}/zed-remote-server-linux-${arch}.gz" "${zed_dir}/libexec/zed-remote-server-linux-${arch}.gz"
+
+# Create archive out of everything that's in the temp directory
 archive="zed-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
 remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
 tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
-
-gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
