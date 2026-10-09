@@ -1,0 +1,23 @@
+script/bundle-linux
+  s_8aa7fd129ae5e1::t_d24c7e81a6fbc4 199-205
+crates/auto_update/src/auto_update.rs
+  s_8aa7fd129ae5e1::t_291f478358b66b 672-678
+  s_8aa7fd129ae5e1::t_76a00212812c58 607-615
+  s_8aa7fd129ae5e1::t_353384a0fb3052 50-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ec078aaab66055b396bfbd7da538d3f51ce4aae0",
+  "prompts": {},
+  "sessions": {
+    "s_8aa7fd129ae5e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8d366047-5d7f-45cd-b4c4-f814332cd8c7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "VaultTec-Dev <vaulttec-dev@proton.me>"
+    }
+  }
+}
