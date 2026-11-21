@@ -4896,7 +4896,7 @@ impl GitPanel {
 
                 let prompt = include_str!("../src/commit_message_prompt.txt");
 
-                let subject = this.update(cx, |this, cx| {
+                let first_line = this.update(cx, |this, cx| {
                     this.commit_editor
                         .read(cx)
                         .text(cx)
@@ -4906,6 +4906,14 @@ impl GitPanel {
                         .unwrap_or_default()
                 })?;
 
+                // A first line made only of issue numbers is a request to link those
+                // issues, not a subject the model should continue.
+                let issues = parse_issue_references(&first_line);
+                let subject = if issues.is_some() {
+                    String::new()
+                } else {
+                    first_line
+                };
                 let text_empty = subject.trim().is_empty();
 
                 let content = Self::build_commit_message_prompt(
@@ -4943,7 +4951,13 @@ impl GitPanel {
                 let stream = provider.stream_completion_text(&model, request, cx);
                 match stream.await {
                     Ok(mut messages) => {
-                        if !text_empty {
+                        if issues.is_some() {
+                            this.update(cx, |this, cx| {
+                                this.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                                    buffer.edit([(0..buffer.len(), "")], None, cx)
+                                });
+                            })?;
+                        } else if !text_empty {
                             this.update(cx, |this, cx| {
                                 this.commit_message_buffer(cx).update(cx, |buffer, cx| {
                                     let insert_position = buffer.anchor_before(buffer.len());
@@ -4956,6 +4970,7 @@ impl GitPanel {
                             })?;
                         }
 
+                        let mut stream_completed = true;
                         while let Some(message) = messages.stream.next().await {
                             match message {
                                 Ok(text) => {
@@ -4973,9 +4988,30 @@ impl GitPanel {
                                 }
                                 Err(e) => {
                                     Self::show_commit_message_error(&this, &e, cx);
+                                    stream_completed = false;
                                     break;
                                 }
                             }
+                        }
+
+                        // Appended by us rather than requested from the model, so the
+                        // closing keywords GitHub relies on are always exact.
+                        if let Some(issues) = issues.filter(|_| stream_completed) {
+                            let footer = issues
+                                .iter()
+                                .map(|issue| format!("Closes #{issue}"))
+                                .join("\n");
+                            this.update(cx, |this, cx| {
+                                this.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                                    let message = buffer.text();
+                                    let trimmed_len = message.trim_end().len();
+                                    buffer.edit(
+                                        [(trimmed_len..buffer.len(), format!("\n\n{footer}"))],
+                                        None,
+                                        cx,
+                                    );
+                                });
+                            })?;
                         }
                     }
                     Err(e) => {
@@ -5022,6 +5058,14 @@ impl GitPanel {
 
         let diff = repo.update(cx, |repo, cx| repo.diff(DiffType::HeadToWorktree, cx));
         let temperature = AgentSettings::temperature_for_model(&model, cx);
+        let issue = self
+            .commit_editor
+            .read(cx)
+            .text(cx)
+            .lines()
+            .next()
+            .and_then(parse_issue_references)
+            .and_then(|issues| issues.first().copied());
 
         self.generate_branch_task = Some(cx.spawn(async move |this, cx| {
             async move {
@@ -5060,7 +5104,13 @@ impl GitPanel {
                 diff_text = Self::compress_commit_diff(&diff_text, MAX_DIFF_BYTES);
 
                 let prompt = include_str!("../src/branch_name_prompt.txt");
-                let content = format!("{prompt}{diff_text}");
+                let issue_section = match issue {
+                    Some(issue) => format!(
+                        "\n\nThese changes close issue #{issue}. Put the issue number right after the prefix, for example: fix/{issue}-short-description"
+                    ),
+                    None => String::new(),
+                };
+                let content = format!("{prompt}{diff_text}{issue_section}");
 
                 let request = LanguageModelRequest {
                     thread_id: None,
@@ -11223,6 +11273,22 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
     max_length > 0 && title.chars().count() > max_length
 }
 
+/// Returns the issue numbers when `line` consists only of references such as
+/// `#42 #57` or `42, 57`.
+fn parse_issue_references(line: &str) -> Option<Vec<u32>> {
+    let mut issues = Vec::new();
+    for token in line.split(|character: char| character.is_whitespace() || character == ',') {
+        if token.is_empty() {
+            continue;
+        }
+        let number = token.strip_prefix('#').unwrap_or(token).parse().ok()?;
+        if !issues.contains(&number) {
+            issues.push(number);
+        }
+    }
+    (!issues.is_empty()).then_some(issues)
+}
+
 #[cfg(test)]
 mod tests {
     use editor::SplittableEditor;
@@ -11259,6 +11325,15 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    #[test]
+    fn test_parse_issue_references() {
+        assert_eq!(parse_issue_references("#42 #57"), Some(vec![42, 57]));
+        assert_eq!(parse_issue_references(" 42, #57, #42 "), Some(vec![42, 57]));
+        assert_eq!(parse_issue_references(""), None);
+        assert_eq!(parse_issue_references("fix #42"), None);
+        assert_eq!(parse_issue_references("Fix crash on push"), None);
     }
 
     #[test]

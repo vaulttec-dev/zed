@@ -6,11 +6,15 @@ Don't repeat information from the subject line in the message body.
 
 Only return the commit message in your response. Do not include any additional meta-commentary about the task. Do not include the raw diff output in the commit message.
 
+Unless the project rules or recent commit messages show a different convention, format the subject line as `<type>: <description>`, where type is one of: feat, fix, refactor, perf, docs, test, chore.
+
+Write the message in the same language as the recent commit messages.
+
 Follow good Git style:
 
 - Separate the subject from the body with a blank line
 - Try to limit the subject line to 50 characters
-- Capitalize the subject line
+- Start the description in lowercase after the type prefix
 - Do not end the subject line with any punctuation
 - Use the imperative mood in the subject line
 - Wrap the body at 72 characters
