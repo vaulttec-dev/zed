@@ -198,7 +198,6 @@ impl TasksModal {
             picker.delegate.last_used_candidate_index = last_used_candidate_index;
             picker.delegate.candidates = Some(new_candidates);
             picker.refresh(window, cx);
-            cx.notify();
         })
     }
 }
@@ -373,7 +372,7 @@ impl PickerDelegate for TasksModalDelegate {
                         let index = delegate
                             .matches
                             .partition_point(|matching_task| matching_task.candidate_id <= index);
-                        Some(index).and_then(|index| (index != 0).then(|| index - 1))
+                        (index != 0).then(|| index - 1)
                     });
 
                     if delegate.matches.is_empty() {
@@ -675,11 +674,11 @@ impl PickerDelegate for TasksModalDelegate {
                     if (current_modifiers.alt || self.matches.is_empty()) && !self.prompt.is_empty()
                     {
                         let action = picker::ConfirmInput {
-                            secondary: current_modifiers.secondary(),
+                            secondary: current_modifiers.secondary(cx),
                         }
                         .boxed_clone();
                         this.child({
-                            let spawn_oneshot_label = if current_modifiers.secondary() {
+                            let spawn_oneshot_label = if current_modifiers.secondary(cx) {
                                 "Spawn Oneshot Without History"
                             } else {
                                 "Spawn Oneshot"
@@ -691,7 +690,7 @@ impl PickerDelegate for TasksModalDelegate {
                                     window.dispatch_action(action.boxed_clone(), cx)
                                 })
                         })
-                    } else if current_modifiers.secondary() {
+                    } else if current_modifiers.secondary(cx) {
                         this.child({
                             let label = if is_recent_selected {
                                 "Rerun Without History"
@@ -1052,10 +1051,11 @@ mod tests {
             Language::new(
                 LanguageConfig {
                     name: "Test".into(),
-                    matcher: LanguageMatcher {
-                        path_suffixes: vec!["test".to_string()],
+                    matcher: (LanguageMatcher {
+                        path_suffixes: vec!["test".into()],
                         ..LanguageMatcher::default()
-                    },
+                    })
+                    .into(),
                     ..LanguageConfig::default()
                 },
                 None,
@@ -1134,10 +1134,11 @@ mod tests {
                 Language::new(
                     LanguageConfig {
                         name: "TypeScript".into(),
-                        matcher: LanguageMatcher {
-                            path_suffixes: vec!["ts".to_string()],
+                        matcher: (LanguageMatcher {
+                            path_suffixes: vec!["ts".into()],
                             ..LanguageMatcher::default()
-                        },
+                        })
+                        .into(),
                         ..LanguageConfig::default()
                     },
                     None,
@@ -1166,10 +1167,11 @@ mod tests {
                 Language::new(
                     LanguageConfig {
                         name: "Rust".into(),
-                        matcher: LanguageMatcher {
-                            path_suffixes: vec!["rs".to_string()],
+                        matcher: (LanguageMatcher {
+                            path_suffixes: vec!["rs".into()],
                             ..LanguageMatcher::default()
-                        },
+                        })
+                        .into(),
                         ..LanguageConfig::default()
                     },
                     None,

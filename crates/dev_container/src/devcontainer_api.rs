@@ -58,6 +58,8 @@ pub(crate) struct DevContainerUp {
     pub(crate) extension_ids: Vec<String>,
     #[serde(default)]
     pub(crate) remote_env: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) started_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -265,7 +267,7 @@ pub async fn start_dev_container_with_config(
         &context,
         environment.clone(),
         actual_config.clone(),
-        context.project_directory.clone().as_ref(),
+        context.project_directory.as_ref(),
     )
     .await
     {

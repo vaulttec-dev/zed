@@ -1,9 +1,10 @@
 use super::tool_permissions::{
     authorize_symlink_access, canonicalize_worktree_roots, detect_symlink_escape,
-    resolve_creatable_global_skill_path, sensitive_settings_kind,
+    global_skill_settings_kind, sensitive_settings_kind,
 };
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::v2::schema as acp;
 use agent_settings::AgentSettings;
+use agent_skills::GlobalSkillFileOperation;
 use futures::FutureExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Task};
 use project::Project;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use util::markdown::MarkdownInlineCode;
 
 use crate::{
-    AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
+    AgentTool, GlobalSkillFiles, ToolCallEventStream, ToolInput, ToolPermissionDecision,
     authorize_with_sensitive_settings, decide_permission_for_path,
 };
 use std::path::{Path, PathBuf};
@@ -23,7 +24,20 @@ use std::path::{Path, PathBuf};
 ///
 /// Use this whenever you need to create new directories. Paths inside the project are created directly.
 ///
-/// This tool can also create a directory **outside** the project. When agent terminal commands are sandboxed, doing so grants those commands write access to exactly that new directory — so, rather than requesting write access to a broad existing parent (e.g. your home directory) just to create something inside it, create the specific directory here first and then write into it. The only other supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+#[cfg_attr(
+    any(target_os = "linux", target_os = "macos"),
+    doc = "This tool can also create a directory **outside** the project. When agent terminal \
+    commands are sandboxed, doing so grants those commands write access to exactly that new \
+    directory — so, rather than requesting write access to a broad existing parent (e.g. your \
+    home directory) just to create something inside it, create the specific directory here \
+    first and then write into it. The only other supported path outside the project is \
+    `~/.agents/skills` or a descendant, for global agent skills."
+)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    doc = "The only supported path outside the project is `~/.agents/skills` or a descendant, \
+    for global agent skills."
+)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateDirectoryToolInput {
     /// The path of the new directory.
@@ -42,10 +56,17 @@ pub struct CreateDirectoryToolInput {
     /// </example>
     pub path: String,
 
-    /// Justification for creating a directory **outside** the project, shown to
-    /// the user (attributed to you) in the approval prompt that grants sandboxed
-    /// terminal commands write access to it. Required only for out-of-project
-    /// paths; ignored for paths inside the project or the global skills dir.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos"),
+        doc = "Justification for creating a directory **outside** the project, shown to the \
+        user (attributed to you) in the approval prompt that grants sandboxed terminal \
+        commands write access to it. Required only for out-of-project paths; ignored for \
+        paths inside the project or the global skills dir."
+    )]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        doc = "Unused on this platform."
+    )]
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -97,8 +118,10 @@ impl AgentTool for CreateDirectoryTool {
             // Resolve where this directory lives. The global agent-skills dir is a
             // special case allowed outside the project; anything else outside the
             // project is handled as a narrow sandbox write grant below.
-            let global_skill_directory =
-                resolve_creatable_global_skill_path(Path::new(&input.path), fs.as_ref()).await;
+            let global_skill_files = cx.update(|cx| GlobalSkillFiles::for_project(&project, cx));
+            let global_skill_directory = global_skill_files
+                .resolve_creatable(Path::new(&input.path), cx)
+                .await;
             let in_project = project.read_with(cx, |project, cx| {
                 project.find_project_path(&input.path, cx).is_some()
             });
@@ -132,7 +155,8 @@ impl AgentTool for CreateDirectoryTool {
 
             let sensitive_kind =
                 sensitive_settings_kind(Path::new(&input.path), &canonical_roots, fs.as_ref())
-                    .await;
+                    .await
+                    .or(global_skill_settings_kind(global_skill_directory.as_ref()));
 
             let decision =
                 if matches!(decision, ToolPermissionDecision::Allow) && sensitive_kind.is_some() {
@@ -178,9 +202,12 @@ impl AgentTool for CreateDirectoryTool {
                 authorize.await.map_err(|e| e.to_string())?;
             }
 
-            if let Some(global_skill_directory) = global_skill_directory {
+            if global_skill_directory.is_some() {
+                let create_directory = GlobalSkillFileOperation::CreateDirectory {
+                    path: PathBuf::from(&input.path),
+                };
                 futures::select! {
-                    result = fs.create_dir(&global_skill_directory).fuse() => {
+                    result = global_skill_files.apply(create_directory, cx).fuse() => {
                         result.map_err(|e| format!("Creating directory {destination_path}: {e}"))?;
                     }
                     _ = event_stream.cancelled_by_user().fuse() => {
@@ -262,8 +289,14 @@ async fn create_out_of_project_directory(
         .map_err(|error| format!("Creating directory {}: {error}", input.path))?;
 
     let canonical = prepared.canonical_path().to_path_buf();
+    // The directory was just created and its inode pinned, so persist the
+    // resolved canonical alongside the raw request: enforcement rebuilds the
+    // grant from the vetted canonical via a verifying reopen.
     let request = crate::sandboxing::SandboxRequest {
-        write_paths: vec![canonical.clone()],
+        write_paths: vec![settings::GrantedWritePath::resolved(
+            prepared.untrusted_raw_path().to_path_buf(),
+            canonical.clone(),
+        )],
         ..Default::default()
     };
 
@@ -362,7 +395,11 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
-        let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
+        let title = auth
+            .tool_call
+            .title
+            .value()
+            .expect("expected authorization title");
         assert!(
             title.contains("agent skills"),
             "Authorization title should mention agent skills, got: {title}",
@@ -475,7 +512,11 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
-        let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
+        let title = auth
+            .tool_call
+            .title
+            .value()
+            .expect("expected authorization title");
         assert!(
             title.contains("points outside the project") || title.contains("symlink"),
             "Authorization title should mention symlink escape, got: {title}",
@@ -598,7 +639,11 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
-        let title = auth.tool_call.fields.title.as_deref().unwrap_or("");
+        let title = auth
+            .tool_call
+            .title
+            .value()
+            .expect("expected authorization title");
         assert!(
             title.contains("points outside the project") || title.contains("symlink"),
             "Authorization title should mention symlink escape, got: {title}",
@@ -725,12 +770,17 @@ mod tests {
         });
 
         let auth = event_rx.expect_authorization().await;
-        let details = acp_thread::sandbox_authorization_details_from_meta(&auth.tool_call.meta)
-            .expect("out-of-project create should request a sandbox write grant");
-        // The grant is for exactly the new directory, not its parent.
+        let details = acp_thread::sandbox_authorization_details_from_meta(
+            &auth.tool_call.meta.clone().take(),
+        )
+        .expect("out-of-project create should request a sandbox write grant");
+        // The grant is for exactly the new directory, not its parent, and
+        // carries the resolved canonical established when it was created.
+        let expected_canonical = scratch.path().canonicalize().unwrap().join("new_grant_dir");
+        assert_eq!(details.write_paths.len(), 1);
         assert_eq!(
-            details.write_paths,
-            vec![scratch.path().canonicalize().unwrap().join("new_grant_dir")]
+            details.write_paths[0].canonical_or_requested(),
+            expected_canonical
         );
 
         auth.response

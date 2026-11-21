@@ -1,19 +1,21 @@
 use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
+    git_panel::GitStatusEntry,
     project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ReviewDiff, render_send_review_to_agent_button,
+        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
+        render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use editor::{
-    Addon, Editor, EditorEvent, RestoreOnlyDiffHunkDelegate, SplittableEditor,
+    Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
+    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
 };
 use language::{BufferId, Capability};
@@ -24,7 +26,7 @@ use project::{
         diff_buffer_list::{self, DiffBase},
     },
 };
-use settings::Settings;
+use settings::{GitDiffBaseSetting, Settings};
 use std::{
     any::{Any, TypeId},
     sync::Arc,
@@ -33,7 +35,7 @@ use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
-    item::{Item, ItemEvent, SaveOptions, TabContentParams},
+    item::{Item, ItemEvent, SaveOptions},
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
@@ -69,14 +71,15 @@ impl Addon for BranchDiffAddon {
 
 impl BranchDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
-        workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(|workspace, _: &DeployBranchDiff, window, cx| {
+            Self::deploy_branch_diff(workspace, window, cx)
+        });
         workspace.register_action(Self::compare_with_branch);
         workspace::register_serializable_item::<Self>(cx);
     }
 
-    fn deploy_branch_diff(
+    pub(crate) fn deploy_branch_diff(
         workspace: &mut Workspace,
-        _: &DeployBranchDiff,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -98,16 +101,32 @@ impl BranchDiff {
         let workspace_weak = workspace.downgrade();
         window
             .spawn(cx, async move |cx| {
-                let base_ref = default_branch
-                    .await??
-                    .context("Could not determine default branch")?;
-
+                let base_ref = default_branch.await??;
                 workspace.update_in(cx, |workspace, window, cx| {
+                    let git_store = project.read(cx).git_store().clone();
+                    let Some(base_ref) = base_ref else {
+                        ProjectDiff::deploy_at(workspace, None, window, cx);
+                        return;
+                    };
+                    let branch_diff =
+                        if git_store.read(cx).diff_base() == GitDiffBaseSetting::DefaultBranch {
+                            Some(git_store.update(cx, |git_store, cx| {
+                                git_store.ensure_display_diff(
+                                    intended_repo.clone(),
+                                    base_ref.clone(),
+                                    cx,
+                                )
+                            }))
+                        } else {
+                            None
+                        };
                     Self::deploy_branch_diff_with_base_ref(
                         workspace,
                         project,
                         intended_repo,
                         base_ref,
+                        branch_diff,
+                        None,
                         window,
                         cx,
                     );
@@ -154,6 +173,8 @@ impl BranchDiff {
                             project.clone(),
                             repository.clone(),
                             base_ref,
+                            None,
+                            None,
                             window,
                             cx,
                         );
@@ -174,11 +195,13 @@ impl BranchDiff {
         });
     }
 
-    fn deploy_branch_diff_with_base_ref(
+    pub(crate) fn deploy_branch_diff_with_base_ref(
         workspace: &mut Workspace,
         project: Entity<Project>,
         intended_repo: Entity<Repository>,
         base_ref: SharedString,
+        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
+        entry: Option<GitStatusEntry>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -187,48 +210,41 @@ impl BranchDiff {
             matches!(
                 item.diff_base(cx),
                 DiffBase::Merge { base_ref: existing_base_ref } if existing_base_ref == &base_ref
-            )
+            ) && item
+                .repo(cx)
+                .is_some_and(|repo| repo.read(cx).id == intended_repo.read(cx).id)
+                && branch_diff.as_ref().is_none_or(|expected| {
+                    item.diff.read(cx).branch_diff().entity_id() == expected.entity_id()
+                })
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
-
-            let needs_switch = existing.read(cx).repo(cx).map_or(true, |current| {
-                current.read(cx).id != intended_repo.read(cx).id
-            });
-
-            if needs_switch {
+            if let Some(entry) = entry {
                 existing.update(cx, |branch_diff, cx| {
-                    branch_diff.set_repo(Some(intended_repo), cx);
+                    branch_diff.move_to_entry(entry, window, cx);
                 });
             }
-
             return;
         }
 
-        let workspace = cx.entity();
-        let workspace_weak = workspace.downgrade();
-        window
-            .spawn(cx, async move |cx| {
-                let this = cx
-                    .update(|window, cx| {
-                        Self::new_with_branch_base(
-                            project,
-                            workspace.clone(),
-                            base_ref,
-                            intended_repo,
-                            window,
-                            cx,
-                        )
-                    })?
-                    .await?;
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
-                    })
-                    .ok();
-                anyhow::Ok(())
-            })
-            .detach_and_notify_err(workspace_weak, window, cx);
+        let workspace_handle = cx.entity();
+        let branch_diff = cx.new(|cx| {
+            Self::new_with_base_ref(
+                project,
+                workspace_handle,
+                base_ref,
+                Some(intended_repo),
+                branch_diff,
+                window,
+                cx,
+            )
+        });
+        workspace.add_item_to_active_pane(Box::new(branch_diff.clone()), None, true, window, cx);
+        if let Some(entry) = entry {
+            branch_diff.update(cx, |branch_diff, cx| {
+                branch_diff.move_to_entry(entry, window, cx);
+            });
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -247,25 +263,25 @@ impl BranchDiff {
                 .await??
                 .context("Could not determine default branch")?;
             cx.update(|window, cx| {
+                let git_store = project.read(cx).git_store().clone();
+                let branch_diff =
+                    if git_store.read(cx).diff_base() == GitDiffBaseSetting::DefaultBranch {
+                        Some(git_store.update(cx, |git_store, cx| {
+                            git_store.ensure_display_diff(repo.clone(), base_ref.clone(), cx)
+                        }))
+                    } else {
+                        None
+                    };
                 cx.new(|cx| {
-                    Self::new_with_base_ref(project, workspace, base_ref, Some(repo), window, cx)
-                })
-            })
-        })
-    }
-
-    pub(crate) fn new_with_branch_base(
-        project: Entity<Project>,
-        workspace: Entity<Workspace>,
-        base_ref: SharedString,
-        repo: Entity<Repository>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Task<Result<Entity<Self>>> {
-        window.spawn(cx, async move |cx| {
-            cx.update(|window, cx| {
-                cx.new(|cx| {
-                    Self::new_with_base_ref(project, workspace, base_ref, Some(repo), window, cx)
+                    Self::new_with_base_ref(
+                        project,
+                        workspace,
+                        base_ref,
+                        Some(repo),
+                        branch_diff,
+                        window,
+                        cx,
+                    )
                 })
             })
         })
@@ -276,20 +292,20 @@ impl BranchDiff {
         workspace: Entity<Workspace>,
         base_ref: SharedString,
         repo: Option<Entity<Repository>>,
+        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch_diff = cx.new(|cx| {
-            let mut branch_diff = diff_buffer_list::DiffBufferList::new(
-                DiffBase::Merge { base_ref },
-                project.clone(),
-                window,
-                cx,
-            );
-            if repo.is_some() {
-                branch_diff.set_repo(repo, cx);
-            }
-            branch_diff
+        let branch_diff = branch_diff.unwrap_or_else(|| {
+            let git_store = project.read(cx).git_store().clone();
+            cx.new(|cx| {
+                diff_buffer_list::DiffBufferList::new(
+                    DiffBase::Merge { base_ref },
+                    git_store,
+                    repo,
+                    cx,
+                )
+            })
         });
         let branch_diff_for_addon = branch_diff.clone();
         let diff = cx.new(|cx| {
@@ -298,7 +314,7 @@ impl BranchDiff {
                 Capability::ReadWrite,
                 "No changes",
                 move |editor, cx| {
-                    editor.set_diff_hunk_delegate(Some(Arc::new(RestoreOnlyDiffHunkDelegate)), cx);
+                    editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, _cx| {
                         rhs_editor.set_read_only(false);
                         rhs_editor.register_addon(BranchDiffAddon {
@@ -340,8 +356,22 @@ impl BranchDiff {
         self.diff.read(cx).repo(cx)
     }
 
-    pub(crate) fn set_repo(&mut self, repo: Option<Entity<Repository>>, cx: &mut Context<Self>) {
-        self.diff.update(cx, |diff, cx| diff.set_repo(repo, cx));
+    pub(crate) fn branch_diff_list(&self, cx: &App) -> Entity<diff_buffer_list::DiffBufferList> {
+        self.diff.read(cx).branch_diff().clone()
+    }
+
+    pub(crate) fn move_to_entry(
+        &mut self,
+        entry: GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_entry(entry, window, cx));
+    }
+
+    pub(crate) fn autoscroll(&self, cx: &mut Context<Self>) {
+        self.diff.update(cx, |diff, cx| diff.autoscroll(cx));
     }
 
     fn set_merge_base(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
@@ -439,16 +469,6 @@ impl Item for BranchDiff {
         Some(self.tab_content_text(0, cx))
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
-        Label::new(self.tab_content_text(0, cx))
-            .color(if params.selected {
-                Color::Default
-            } else {
-                Color::Muted
-            })
-            .into_any_element()
-    }
-
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
@@ -507,8 +527,17 @@ impl Item for BranchDiff {
         };
         let repo = self.repo(cx);
         let project = self.project.clone();
+        let branch_diff = self.diff.read(cx).branch_diff().clone();
         Task::ready(Some(cx.new(|cx| {
-            Self::new_with_base_ref(project, workspace, base_ref, repo, window, cx)
+            Self::new_with_base_ref(
+                project,
+                workspace,
+                base_ref,
+                repo,
+                Some(branch_diff),
+                window,
+                cx,
+            )
         })))
     }
 
@@ -635,7 +664,9 @@ impl SerializableItem for BranchDiff {
             };
             let workspace = workspace.upgrade().context("workspace gone")?;
             cx.update(|window, cx| {
-                cx.new(|cx| Self::new_with_base_ref(project, workspace, base_ref, None, window, cx))
+                cx.new(|cx| {
+                    Self::new_with_base_ref(project, workspace, base_ref, None, None, window, cx)
+                })
             })
         })
     }
@@ -645,7 +676,6 @@ impl SerializableItem for BranchDiff {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
@@ -741,6 +771,16 @@ impl Render for BranchDiffToolbar {
         let base_ref_label = format!("Base: {base_ref}");
         let repository = branch_diff.read(cx).repo(cx);
         let workspace = branch_diff.read(cx).workspace.clone();
+        let project = branch_diff.read(cx).project.clone();
+        let buffers = branch_diff.read(cx).diff.read(cx).branch_diff().clone();
+        let uses_display_diff = repository.as_ref().is_some_and(|repository| {
+            project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .display_diff_for_repo(repository.read(cx).id)
+                .is_some_and(|display_diff| display_diff.entity_id() == buffers.entity_id())
+        });
         let view_for_picker = branch_diff.downgrade();
 
         let is_multibuffer_empty = branch_diff
@@ -772,17 +812,40 @@ impl Render for BranchDiffToolbar {
                 PopoverMenu::new("branch-diff-base-branch-picker")
                     .menu(move |window, cx| {
                         let view_for_picker = view_for_picker.clone();
+                        let workspace_for_select = workspace.clone();
+                        let repository_for_select = repository.clone();
+                        let project = project.clone();
                         let on_select = Arc::new(
                             move |branch: git::repository::Branch,
-                                  _window: &mut Window,
+                                  window: &mut Window,
                                   cx: &mut App| {
                                 let base_ref: SharedString = branch.name().to_owned().into();
-                                view_for_picker
-                                    .update(cx, |branch_diff, cx| {
-                                        branch_diff.set_merge_base(base_ref, cx);
-                                        cx.notify();
-                                    })
-                                    .ok();
+                                if uses_display_diff {
+                                    let Some(repository) = repository_for_select.clone() else {
+                                        return;
+                                    };
+                                    workspace_for_select
+                                        .update(cx, |workspace, cx| {
+                                            BranchDiff::deploy_branch_diff_with_base_ref(
+                                                workspace,
+                                                project.clone(),
+                                                repository,
+                                                base_ref,
+                                                None,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                } else {
+                                    view_for_picker
+                                        .update(cx, |branch_diff, cx| {
+                                            branch_diff.set_merge_base(base_ref, cx);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
                             },
                         );
 
@@ -841,7 +904,6 @@ impl Render for BranchDiffToolbar {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::anyhow;
     use collections::HashMap;
     use editor::test::editor_test_context::assert_state_with_diff;
     use git::status::{FileStatus, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
@@ -1074,16 +1136,20 @@ mod tests {
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
 
-        assert_state_with_diff(
-            &editor,
-            cx,
-            &"
+        let expected_diff = "
                 - A
-                + ˇC
-                + new
+                + C
+                + ˇnew
                 + created-in-head"
-                .unindent(),
-        );
+            .unindent();
+        assert_state_with_diff(&editor, cx, &expected_diff);
+
+        cx.update(|window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            window.dispatch_action(git::Restore.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_state_with_diff(&editor, cx, &expected_diff);
 
         let statuses: HashMap<Arc<RelPath>, Option<FileStatus>> =
             editor.update(cx, |editor, cx| {
@@ -1141,22 +1207,20 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
-        let target_branch_diff = cx
-            .update(|window, cx| {
-                let Some(repository) = project.read(cx).active_repository(cx) else {
-                    return Task::ready(Err(anyhow!("No active repository")));
-                };
-                BranchDiff::new_with_branch_base(
+        let target_branch_diff = cx.update(|window, cx| {
+            let repository = project.read(cx).active_repository(cx);
+            cx.new(|cx| {
+                BranchDiff::new_with_base_ref(
                     project.clone(),
                     workspace.clone(),
                     "topic".into(),
                     repository,
+                    None,
                     window,
                     cx,
                 )
             })
-            .await
-            .unwrap();
+        });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(
                 Box::new(target_branch_diff.clone()),

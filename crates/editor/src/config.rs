@@ -43,7 +43,9 @@ impl Editor {
                 .filter(|_| self.is_empty(cx))
                 .unwrap_or(&self.display_map);
 
-            display_map.update(cx, |map, cx| map.set_font(font, font_size, cx));
+            if display_map.update(cx, |map, cx| map.set_font(font, font_size, cx)) {
+                self.inlay_hint_visibility_changed(cx);
+            }
         }
         self.style = Some(style);
     }
@@ -59,15 +61,6 @@ impl Editor {
 
     pub fn set_show_indent_guides(&mut self, show_indent_guides: bool, cx: &mut Context<Self>) {
         self.show_indent_guides = Some(show_indent_guides);
-        cx.notify();
-    }
-
-    pub fn disable_indent_guides_for_buffer(
-        &mut self,
-        buffer_id: BufferId,
-        cx: &mut Context<Self>,
-    ) {
-        self.buffers_with_disabled_indent_guides.insert(buffer_id);
         cx.notify();
     }
 
@@ -113,11 +106,6 @@ impl Editor {
 
     pub fn set_show_vertical_scrollbar(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_scrollbars.vertical = show;
-        cx.notify();
-    }
-
-    pub fn set_show_horizontal_scrollbar(&mut self, show: bool, cx: &mut Context<Self>) {
-        self.show_scrollbars.horizontal = show;
         cx.notify();
     }
 
@@ -198,6 +186,16 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_allow_git_diff_scrollbar_markers(&mut self, allow: bool, cx: &mut Context<Self>) {
+        if self.allow_git_diff_scrollbar_markers != allow {
+            self.allow_git_diff_scrollbar_markers = allow;
+            self.scrollbar_marker_state.dirty = true;
+            self.scrollbar_marker_state.markers = Default::default();
+            self.scrollbar_marker_state.pending_refresh = None;
+            cx.notify();
+        }
+    }
+
     pub fn set_show_code_actions(&mut self, show_code_actions: bool, cx: &mut Context<Self>) {
         self.show_code_actions = Some(show_code_actions);
         cx.notify();
@@ -247,7 +245,11 @@ impl Editor {
         wrap_guides
     }
 
-    pub(super) fn soft_wrap_mode(&self, cx: &App) -> SoftWrap {
+    pub(super) fn soft_wrap_indent(&self, cx: &App) -> SoftWrapIndent {
+        self.buffer.read(cx).language_settings(cx).soft_wrap_indent
+    }
+
+    pub fn soft_wrap_mode(&self, cx: &App) -> SoftWrap {
         let settings = self.buffer.read(cx).language_settings(cx);
         let mode = self.soft_wrap_mode_override.unwrap_or(settings.soft_wrap);
         match mode {
@@ -263,25 +265,32 @@ impl Editor {
 
     // Called by the element. This method is not designed to be called outside of the editor
     // element's layout code because it does not notify when rewrapping is computed synchronously.
-    pub(super) fn set_wrap_width(&self, width: Option<Pixels>, cx: &mut App) -> bool {
-        if self.is_empty(cx) {
+    pub(super) fn set_wrap_width(&mut self, width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
+        let indent = self.soft_wrap_indent(cx);
+        let changed = if self.is_empty(cx) {
             self.placeholder_display_map
                 .as_ref()
                 .map_or(false, |display_map| {
-                    display_map.update(cx, |map, cx| map.set_wrap_width(width, cx))
+                    display_map.update(cx, |map, cx| {
+                        let wrap_width_changed = map.set_wrap_width(width, cx);
+                        let indent_changed = map.set_soft_wrap_indent(indent, cx);
+                        wrap_width_changed || indent_changed
+                    })
                 })
         } else {
-            self.display_map
-                .update(cx, |map, cx| map.set_wrap_width(width, cx))
+            self.display_map.update(cx, |map, cx| {
+                let wrap_width_changed = map.set_wrap_width(width, cx);
+                let indent_changed = map.set_soft_wrap_indent(indent, cx);
+                wrap_width_changed || indent_changed
+            })
+        };
+        if changed {
+            self.inlay_hint_visibility_changed(cx);
         }
+        changed
     }
 
-    pub(super) fn toggle_soft_wrap(
-        &mut self,
-        _: &ToggleSoftWrap,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
         if self.soft_wrap_mode_override.is_some() {
             self.soft_wrap_mode_override.take();
         } else {
@@ -330,11 +339,6 @@ impl Editor {
 
     pub(super) fn should_show_indent_guides(&self) -> Option<bool> {
         self.show_indent_guides
-    }
-
-    pub(super) fn has_indent_guides_disabled_for_buffer(&self, buffer_id: BufferId) -> bool {
-        self.buffers_with_disabled_indent_guides
-            .contains(&buffer_id)
     }
 
     pub(super) fn toggle_relative_line_numbers(

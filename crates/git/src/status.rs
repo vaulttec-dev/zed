@@ -118,8 +118,8 @@ impl FileStatus {
             }
             .into(),
             [b'D', b'D'] => UnmergedStatus {
-                first_head: UnmergedStatusCode::Added,
-                second_head: UnmergedStatusCode::Added,
+                first_head: UnmergedStatusCode::Deleted,
+                second_head: UnmergedStatusCode::Deleted,
             }
             .into(),
             [x, b'U'] => UnmergedStatus {
@@ -503,26 +503,13 @@ pub enum DiffTreeType {
         base: SharedString,
         head: SharedString,
     },
+    MergeBaseWithWorktree {
+        base: SharedString,
+    },
     Since {
         base: SharedString,
         head: SharedString,
     },
-}
-
-impl DiffTreeType {
-    pub fn base(&self) -> &SharedString {
-        match self {
-            DiffTreeType::MergeBase { base, .. } => base,
-            DiffTreeType::Since { base, .. } => base,
-        }
-    }
-
-    pub fn head(&self) -> &SharedString {
-        match self {
-            DiffTreeType::MergeBase { head, .. } => head,
-            DiffTreeType::Since { head, .. } => head,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -620,7 +607,7 @@ pub fn parse_numstat(output: &str) -> GitDiffStat {
         };
         entries.push((path, DiffStat { added, deleted }));
     }
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     entries.dedup_by(|(a, _), (b, _)| a == b);
 
     GitDiffStat {
@@ -633,7 +620,9 @@ mod tests {
 
     use crate::{
         repository::RepoPath,
-        status::{FileStatus, GitStatus, TreeDiff, TreeDiffStatus},
+        status::{
+            FileStatus, GitStatus, TreeDiff, TreeDiffStatus, UnmergedStatus, UnmergedStatusCode,
+        },
     };
 
     use super::{DiffStat, parse_numstat};
@@ -727,6 +716,34 @@ mod tests {
                 deleted: 0
             })
         );
+    }
+
+    #[test]
+    fn test_parse_unmerged_status_codes() {
+        use UnmergedStatusCode::{Added, Deleted, Updated};
+
+        let cases = [
+            ("DD", Deleted, Deleted),
+            ("AU", Added, Updated),
+            ("UD", Updated, Deleted),
+            ("UA", Updated, Added),
+            ("DU", Deleted, Updated),
+            ("AA", Added, Added),
+            ("UU", Updated, Updated),
+        ];
+
+        for (code, first_head, second_head) in cases {
+            let status: GitStatus = format!("{code} conflicted.txt\0").parse().unwrap();
+            assert_eq!(status.entries.len(), 1, "{code}");
+            assert_eq!(
+                status.entries[0].1,
+                FileStatus::Unmerged(UnmergedStatus {
+                    first_head,
+                    second_head,
+                }),
+                "{code}"
+            );
+        }
     }
 
     #[test]

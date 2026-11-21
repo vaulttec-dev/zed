@@ -5,8 +5,8 @@ use call::{ActiveCall, Room};
 use channel::ChannelStore;
 use client::{User, proto::PeerId};
 use gpui::{
-    AnyElement, Empty, Hsla, IntoElement, MouseButton, Path, ScreenCaptureSource, Styled, TaskExt,
-    WeakEntity, canvas, point,
+    AnyElement, Empty, Hsla, IntoElement, MouseButton, PathBuilder, ScreenCaptureSource, Styled,
+    TaskExt, WeakEntity, canvas, point,
 };
 use gpui::{App, Task, Window};
 use icons::IconName;
@@ -27,7 +27,7 @@ use zed_actions::ShowCallStats;
 
 use crate::TitleBar;
 
-fn format_stat(value: Option<f64>, format: impl Fn(f64) -> String) -> String {
+fn format_stat<T>(value: Option<T>, format: impl Fn(T) -> String) -> String {
     match value {
         Some(v) => format(v),
         None => "—".to_string(),
@@ -123,18 +123,21 @@ fn render_color_ribbon(color: Hsla) -> impl Element {
             let height = bounds.size.height;
             let horizontal_offset = height;
             let vertical_offset = height / 2.0;
-            let mut path = Path::new(bounds.bottom_left());
-            path.curve_to(
+            let mut builder = PathBuilder::fill();
+            builder.move_to(bounds.bottom_left());
+            builder.curve_to(
                 bounds.origin + point(horizontal_offset, vertical_offset),
                 bounds.origin + point(px(0.0), vertical_offset),
             );
-            path.line_to(bounds.top_right() + point(-horizontal_offset, vertical_offset));
-            path.curve_to(
+            builder.line_to(bounds.top_right() + point(-horizontal_offset, vertical_offset));
+            builder.curve_to(
                 bounds.bottom_right(),
                 bounds.top_right() + point(px(0.0), vertical_offset),
             );
-            path.line_to(bounds.bottom_left());
-            window.paint_path(path, color);
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         },
     )
     .h_1()
@@ -373,7 +376,10 @@ impl TitleBar {
             .channel_id()
             .and_then(|channel_id| channel_store.read(cx).channel_for_id(channel_id).cloned());
 
-        let effective_quality = stats.effective_quality.unwrap_or(ConnectionQuality::Lost);
+        let effective_quality = stats
+            .effective_quality
+            .map(|inner| inner.0)
+            .unwrap_or(ConnectionQuality::Lost);
         let (signal_icon, signal_color, quality_label) = match effective_quality {
             ConnectionQuality::Excellent => {
                 (IconName::SignalHigh, Some(Color::Success), "Excellent")
@@ -414,8 +420,8 @@ impl TitleBar {
                         let packet_loss =
                             format_stat(stats.packet_loss_pct, |v| format!("{:.1}%", v));
                         let input_lag =
-                            format_stat(stats.input_lag.map(|d| d.as_secs_f64() * 1000.0), |v| {
-                                format!("{:.1}ms", v)
+                            format_stat(stats.input_lag.map(|d| d.0.as_millis()), |v| {
+                                format!("{}ms", v)
                             });
 
                         let key_binding = KeyBinding::for_action(&ShowCallStats, cx);

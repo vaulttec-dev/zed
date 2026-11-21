@@ -146,7 +146,7 @@ pub fn find_context_candidates(text: &str, hunk: &mut Hunk) -> Vec<usize> {
         return candidates;
     }
 
-    if hunk.context.ends_with('\n') && !hunk.context.is_empty() {
+    if hunk.context.ends_with('\n') {
         let old_len = hunk.context.len();
         hunk.context.pop();
         let new_len = hunk.context.len();
@@ -289,7 +289,7 @@ impl<'a> OffsetUnifiedDiffBuilder<'a> {
             self.after_hunk_len,
         )
         .unwrap();
-        write!(&mut self.dst, "{}", &self.buffer).unwrap();
+        write!(&mut self.dst, "{}", self.buffer).unwrap();
         self.buffer.clear();
         self.before_hunk_len = 0;
         self.after_hunk_len = 0;

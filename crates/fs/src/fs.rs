@@ -1,6 +1,5 @@
 pub mod fs_watcher;
-
-pub use fs_watcher::requires_poll_watcher;
+mod git_clone_progress;
 
 use parking_lot::Mutex;
 use slotmap::{KeyData, SlotMap};
@@ -9,7 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Instant;
 use util::maybe;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
 use futures::stream::iter;
 use gpui::App;
 use gpui::BackgroundExecutor;
@@ -18,7 +17,7 @@ use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
-use util::command::new_command;
+use util::command::{Stdio, new_command};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
@@ -26,7 +25,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
@@ -34,6 +33,7 @@ use std::mem::MaybeUninit;
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
 use git::repository::{GitRepository, RealGitRepository};
+#[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,8 @@ mod fake_git_repo;
 #[cfg(feature = "test-support")]
 use collections::{BTreeMap, btree_map};
 #[cfg(feature = "test-support")]
+pub use fake_git_repo::FakeBlobReadGate;
+#[cfg(feature = "test-support")]
 use fake_git_repo::{FakeCommitDataEntry, FakeGitRepositoryState};
 #[cfg(feature = "test-support")]
 use git::{
@@ -62,7 +64,7 @@ use git::{
     status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus},
 };
 #[cfg(feature = "test-support")]
-use path::normalize_path;
+use util::paths::normalize_path;
 
 #[cfg(feature = "test-support")]
 use smol::io::AsyncReadExt;
@@ -73,6 +75,10 @@ pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
     fn remove(&self, path: &Path) -> Result<()>;
 }
+
+pub trait ReadSeek: io::Read + io::Seek {}
+
+impl<T: io::Read + io::Seek + ?Sized> ReadSeek for T {}
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum PathEventKind {
@@ -127,8 +133,23 @@ pub trait Fs: Send + Sync {
     /// trash.
     async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()>;
 
+    /// Takes an advisory lock on the file at `path`, creating the file if it doesn't
+    /// exist, and waits for conflicting locks to be released first.
+    ///
+    /// The lock is honored by every process that locks the same file, and is released
+    /// when the returned [`FileLock`] is dropped or this process exits. Dropping the
+    /// returned future stops waiting for the lock.
+    ///
+    /// The lock is on the file that is at `path` when this is called, even if that file
+    /// is removed or replaced while waiting.
+    async fn lock_file(&self, path: &Path, kind: FileLockKind) -> Result<FileLock>;
+
+    /// Like [`Fs::lock_file`], but returns `None` instead of waiting when a conflicting
+    /// lock is held.
+    async fn try_lock_file(&self, path: &Path, kind: FileLockKind) -> Result<Option<FileLock>>;
+
     async fn open_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>>;
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>>;
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn ReadSeek + Send + Sync>>;
     async fn load(&self, path: &Path) -> Result<String> {
         Ok(String::from_utf8(self.load_bytes(path).await?)?)
     }
@@ -145,6 +166,26 @@ pub trait Fs: Send + Sync {
         &self,
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>>;
+
+    /// Creates the native file watcher now rather than on the first `watch`, so a
+    /// failure to start it (e.g. inotify instance limits) can be reported at startup.
+    fn start_native_watcher(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Records raw local watcher notifications until the returned recording is dropped.
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        None
+    }
+
+    /// Whether `path` exists, without following a final symlink. Synchronous
+    /// because watches are registered synchronously by the worktree scanner.
+    fn path_exists(&self, path: &Path) -> bool;
+    /// Whether the volume holding `path` compares file names case-sensitively.
+    fn is_path_case_sensitive(&self, path: &Path) -> bool;
+    /// Whether `path` sits on a filesystem where native file watching does not
+    /// deliver events (network mounts, some FUSE and WSL mounts), so it must be polled.
+    fn requires_poll_watcher(&self, path: &Path) -> bool;
 
     async fn watch(
         &self,
@@ -168,9 +209,12 @@ pub trait Fs: Send + Sync {
     async fn is_case_sensitive(&self) -> bool;
     fn subscribe_to_jobs(&self) -> JobEventReceiver;
 
-    /// Restores a given `TrashedEntry`, moving it from the system's trash back
-    /// to the original path.
-    async fn restore(&self, item: TrashId) -> std::result::Result<PathBuf, TrashRestoreError>;
+    /// Returns the original absolute path of the item identified by `trash_id`.
+    fn original_path_for_trash_id(&self, trash_id: TrashId) -> Option<PathBuf>;
+
+    /// Restores the item identified by `trash_id`, moving it from the system's
+    /// trash back to its original path.
+    async fn restore(&self, trash_id: TrashId) -> std::result::Result<PathBuf, TrashRestoreError>;
 
     #[cfg(feature = "test-support")]
     fn as_fake(&self) -> Arc<FakeFs> {
@@ -289,6 +333,35 @@ pub struct RemoveOptions {
     pub ignore_if_not_exists: bool,
 }
 
+/// Whether a lock taken with [`Fs::lock_file`] can be held at the same time as others.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileLockKind {
+    /// Can be held together with other shared locks on the same file.
+    Shared,
+    /// Can't be held together with any other lock on the same file.
+    Exclusive,
+}
+
+/// An advisory lock on a file, taken with [`Fs::lock_file`] or [`Fs::try_lock_file`]
+/// and released when dropped.
+pub struct FileLock {
+    _release_on_drop: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl FileLock {
+    fn new(release_on_drop: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            _release_on_drop: Box::new(release_on_drop),
+        }
+    }
+}
+
+impl std::fmt::Debug for FileLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("FileLock").finish_non_exhaustive()
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Metadata {
     pub inode: u64,
@@ -323,6 +396,7 @@ pub struct JobInfo {
 #[derive(Debug, Clone)]
 pub enum JobEvent {
     Started { info: JobInfo },
+    Updated { id: JobId, message: SharedString },
     Completed { id: JobId },
 }
 
@@ -346,6 +420,18 @@ impl JobTracker {
             });
         }
         Self { id, subscribers }
+    }
+
+    fn update(&self, message: SharedString) {
+        let mut subscribers = self.subscribers.lock();
+        subscribers.retain(|sender| {
+            sender
+                .unbounded_send(JobEvent::Updated {
+                    id: self.id,
+                    message: message.clone(),
+                })
+                .is_ok()
+        });
     }
 }
 
@@ -412,8 +498,11 @@ impl TrashId {
 }
 
 pub struct RealFs {
+    this: std::sync::Weak<Self>,
     bundled_git_binary_path: Option<PathBuf>,
     executor: BackgroundExecutor,
+    native_watcher: Arc<fs_watcher::OsWatcher>,
+    poll_watcher: Arc<fs_watcher::OsWatcher>,
     next_job_id: Arc<AtomicUsize>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Arc<Mutex<SlotMap<TrashId, TrashedEntry>>>,
@@ -518,15 +607,69 @@ impl FileHandle for std::fs::File {
 
 pub struct RealWatcher {}
 
+const FILE_LOCK_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(5);
+const FILE_LOCK_MAX_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 impl RealFs {
-    pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Self {
-        Self {
+    pub fn new(git_binary_path: Option<PathBuf>, executor: BackgroundExecutor) -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             bundled_git_binary_path: git_binary_path,
+            native_watcher: fs_watcher::OsWatcher::new(
+                fs_watcher::OsWatcherKind::Native,
+                executor.clone(),
+            ),
+            poll_watcher: fs_watcher::OsWatcher::new(
+                fs_watcher::OsWatcherKind::Poll,
+                executor.clone(),
+            ),
             executor,
             next_job_id: Arc::new(AtomicUsize::new(0)),
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             trash: Arc::new(Mutex::new(SlotMap::with_key())),
             is_case_sensitive: Default::default(),
+        })
+    }
+
+    async fn open_lock_file(&self, path: &Path) -> Result<Arc<std::fs::File>> {
+        let path = path.to_owned();
+        self.executor
+            .spawn(async move {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+                    .with_context(|| format!("opening {path:?}"))?;
+                Ok(Arc::new(file))
+            })
+            .await
+    }
+
+    /// Returns whether the lock was taken.
+    async fn try_lock_open_file(
+        &self,
+        file: &Arc<std::fs::File>,
+        path: &Path,
+        kind: FileLockKind,
+    ) -> Result<bool> {
+        let file = file.clone();
+        let result = self
+            .executor
+            .spawn(async move {
+                match kind {
+                    FileLockKind::Shared => file.try_lock_shared(),
+                    FileLockKind::Exclusive => file.try_lock(),
+                }
+            })
+            .await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("locking {path:?}"))
+            }
         }
     }
 
@@ -627,6 +770,59 @@ fn path_to_c_string(path: &Path) -> io::Result<CString> {
             format!("path contains interior NUL: {}", path.display()),
         )
     })
+}
+
+// On Unix targets, std::fs::ReadDir panics in its Drop implementation
+// when an unexpected error is returned from closedir(2). We hit this
+// condition in production; one cause seems to be macOS's FSEventStream
+// incorrectly closing fds it doesn't own, resulting in closedir returning
+// EBADF, see https://github.com/zed-industries/zed/issues/59952#issuecomment-5080178879.
+//
+// We also see occasional errors like ENXIO and ETIMEDOUT that seem to
+// come from network or other exotic filesystems.
+//
+// To avoid crashing the app in this situation, we use the rustix analogue of
+// ReadDir, which doesn't have this panic in drop.
+#[cfg(unix)]
+fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<PathBuf>>> {
+    use rustix::fs::{Dir, Mode, OFlags};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory_fd = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("failed to open directory {path:?}"))?;
+    let directory =
+        Dir::new(directory_fd).with_context(|| format!("failed to read directory {path:?}"))?;
+
+    Ok(directory.filter_map(move |entry| {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Some(Err(anyhow::Error::new(error)
+                    .context(format!("failed to read directory entry in {path:?}"))));
+            }
+        };
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            return None;
+        }
+        Some(Ok(path.join(OsStr::from_bytes(name))))
+    }))
+}
+
+#[cfg(not(unix))]
+fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<PathBuf>>> {
+    let entries =
+        std::fs::read_dir(&path).with_context(|| format!("failed to open directory {path:?}"))?;
+    Ok(entries.map(move |entry| {
+        entry
+            .map(|entry| entry.path())
+            .with_context(|| format!("failed to read directory entry in {path:?}"))
+    }))
 }
 
 #[async_trait::async_trait]
@@ -767,7 +963,11 @@ impl Fs for RealFs {
             if options.ignore_if_exists {
                 return Ok(());
             } else {
-                anyhow::bail!("{target:?} already exists");
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{target:?} already exists"),
+                )
+                .into());
             }
         }
 
@@ -816,6 +1016,27 @@ impl Fs for RealFs {
         }
     }
 
+    async fn lock_file(&self, path: &Path, kind: FileLockKind) -> Result<FileLock> {
+        let file = self.open_lock_file(path).await?;
+        // Waiting for the lock inside the operating system would occupy a thread until
+        // the lock is granted, even after the caller stopped waiting. Enough of those
+        // waits would leave no thread for the file operations of the lock's holder.
+        let mut retry_delay = FILE_LOCK_INITIAL_RETRY_DELAY;
+        loop {
+            if self.try_lock_open_file(&file, path, kind).await? {
+                return Ok(FileLock::new(file));
+            }
+            self.executor.timer(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(FILE_LOCK_MAX_RETRY_DELAY);
+        }
+    }
+
+    async fn try_lock_file(&self, path: &Path, kind: FileLockKind) -> Result<Option<FileLock>> {
+        let file = self.open_lock_file(path).await?;
+        let locked = self.try_lock_open_file(&file, path, kind).await?;
+        Ok(locked.then(|| FileLock::new(file)))
+    }
+
     async fn trash(&self, path: &Path, _options: RemoveOptions) -> Result<TrashId> {
         // We must make the path absolute or trash will make a weird abomination
         // of the zed working directory (not usually the worktree) and whatever
@@ -833,7 +1054,7 @@ impl Fs for RealFs {
         Ok(self.trash.lock().insert(entry))
     }
 
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn ReadSeek + Send + Sync>> {
         Ok(Box::new(std::fs::File::open(path)?))
     }
 
@@ -1031,7 +1252,12 @@ impl Fs for RealFs {
         #[cfg(unix)]
         let is_fifo = metadata.file_type().is_fifo();
 
+        #[cfg(unix)]
+        let is_executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+
+        #[cfg(windows)]
         let path_buf = path.to_path_buf();
+        #[cfg(windows)]
         let is_executable = self
             .executor
             .spawn(async move { path_buf.is_executable() })
@@ -1063,16 +1289,34 @@ impl Fs for RealFs {
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>> {
         let path = path.to_owned();
-        let result = iter(
-            self.executor
-                .spawn(async move { std::fs::read_dir(path) })
-                .await?,
-        )
-        .map(|entry| match entry {
-            Ok(entry) => Ok(entry.path()),
-            Err(error) => Err(anyhow!("failed to read dir entry {error:?}")),
-        });
-        Ok(Box::pin(result))
+        let entries = self
+            .executor
+            .spawn(async move { read_dir_entries(path) })
+            .await?;
+        Ok(Box::pin(iter(entries)))
+    }
+
+    fn start_native_watcher(&self) -> Result<()> {
+        self.native_watcher.ensure_backend()
+    }
+
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        Some(fs_watcher::WatchRecording::new([
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+        ]))
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn is_path_case_sensitive(&self, path: &Path) -> bool {
+        !fs_watcher::case_insensitive_path(path)
+    }
+
+    fn requires_poll_watcher(&self, path: &Path) -> bool {
+        fs_watcher::requires_poll_watcher(path)
     }
 
     async fn watch(
@@ -1083,62 +1327,19 @@ impl Fs for RealFs {
         Pin<Box<dyn Send + Stream<Item = Vec<PathEvent>>>>,
         Arc<dyn Watcher>,
     ) {
-        use util::{ResultExt as _, paths::SanitizedPath};
-        let executor = self.executor.clone();
-
-        let (tx, rx) = async_channel::unbounded();
-        let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
-
-        let watcher: Arc<dyn Watcher> = Arc::new(fs_watcher::FsWatcher::new(
-            executor.clone(),
-            tx.clone(),
-            pending_paths.clone(),
-        ));
-
-        if let Err(e) = watcher.add(path) {
-            log::warn!("Failed to watch {}:\n{e}", path.display());
-        }
-
-        // Check if path is a symlink and follow the target parent
-        if let Some(mut target) = self.read_link(path).await.ok() {
-            log::trace!("watch symlink {path:?} -> {target:?}");
-            // Check if symlink target is relative path, if so make it absolute
-            if target.is_relative()
-                && let Some(parent) = path.parent()
-            {
-                target = parent.join(target);
-                if let Ok(canonical) = self.canonicalize(&target).await {
-                    target = SanitizedPath::new(&canonical).as_path().to_path_buf();
-                }
-            }
-            watcher.add(&target).ok();
-            // Skipped for poll watchers: PollWatcher::watch() recursively scans
-            // at registration, blocking on large virtual filesystem mounts
-            if let Some(parent) = target.parent()
-                && !fs_watcher::requires_poll_watcher(parent)
-            {
-                watcher.add(parent).log_err();
-            }
-        }
-
-        (
-            Box::pin(rx.filter_map({
-                let watcher = watcher.clone();
-                let executor = executor.clone();
-                move |_| {
-                    let _ = watcher.clone();
-                    let pending_paths = pending_paths.clone();
-                    let executor = executor.clone();
-                    async move {
-                        executor.timer(latency).await;
-                        let paths = std::mem::take(&mut *pending_paths.lock());
-                        log::debug!("pending path events: {:?}", paths);
-                        (!paths.is_empty()).then_some(paths)
-                    }
-                }
-            })),
-            watcher,
+        let this = self
+            .this
+            .upgrade()
+            .expect("RealFs is only constructed inside an Arc");
+        fs_watcher::watch(
+            this,
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+            self.executor.clone(),
+            path,
+            latency,
         )
+        .await
     }
 
     fn open_repo(
@@ -1191,18 +1392,28 @@ impl Fs for RealFs {
             message: SharedString::from(format!("Cloning {}", repo_url)),
         };
 
-        let _job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
-
-        let output = new_command("git")
+        let job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
+        let mut child = new_command("git")
             .current_dir(abs_work_directory)
-            .args(&["clone", repo_url])
-            .output()
-            .await?;
+            .args(["clone", "--progress", repo_url])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to read git clone progress")?;
+        let stderr_output = git_clone_progress::read(stderr, |message| {
+            job_tracker.update(message.into());
+        })
+        .await?;
+        let status = child.status().await?;
 
-        if !output.status.success() {
+        if !status.success() {
             anyhow::bail!(
                 "git clone failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                git_clone_progress::failure_message(&stderr_output)
             );
         }
 
@@ -1300,11 +1511,19 @@ impl Fs for RealFs {
         res
     }
 
-    async fn restore(&self, item: TrashId) -> std::result::Result<PathBuf, TrashRestoreError> {
+    fn original_path_for_trash_id(&self, trash_id: TrashId) -> Option<PathBuf> {
+        self.trash
+            .lock()
+            .get(trash_id)
+            .map(|entry| entry.original_parent.join(&entry.name))
+    }
+
+    async fn restore(&self, trash_id: TrashId) -> std::result::Result<PathBuf, TrashRestoreError> {
         let trashed_entry = self
             .trash
             .lock()
-            .remove(item)
+            .get(trash_id)
+            .cloned()
             .ok_or(TrashRestoreError::AlreadyRestored)?;
 
         let restored_item_path = trashed_entry.original_parent.join(&trashed_entry.name);
@@ -1317,7 +1536,9 @@ impl Fs for RealFs {
                 tx.send(res)
             })
             .expect("The OS can spawn a threads");
+
         rx.await.expect("Restore all never panics")?;
+        self.trash.lock().remove(trash_id);
         Ok(restored_item_path)
     }
 }
@@ -1339,6 +1560,8 @@ pub struct FakeFs {
     // Use an unfair lock to ensure tests are deterministic.
     state: Arc<Mutex<FakeFsState>>,
     executor: gpui::BackgroundExecutor,
+    native_watcher: Arc<fs_watcher::OsWatcher>,
+    poll_watcher: Arc<fs_watcher::OsWatcher>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1346,50 +1569,56 @@ struct FakeFsState {
     root: FakeFsEntry,
     next_inode: u64,
     next_mtime: SystemTime,
-    git_event_tx: async_channel::Sender<PathBuf>,
-    event_txs: Vec<(PathBuf, async_channel::Sender<Vec<PathEvent>>)>,
+    watch_roots: Vec<(PathBuf, std::sync::Weak<dyn Watcher>)>,
+    watches: FakeWatches,
     events_paused: bool,
     buffered_events: Vec<PathEvent>,
     metadata_call_count: usize,
     read_dir_call_count: usize,
+    read_dir_hooks: BTreeMap<PathBuf, BoxFuture<'static, ()>>,
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
-    moves: std::collections::HashMap<u64, PathBuf>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
-    file_to_create_before_watch_add: Option<(PathBuf, PathBuf)>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
+    case_sensitive: bool,
+    // Keyed by inode because, as on a real file system, a lock belongs to the file
+    // rather than its path: a file created in place of a removed one is unlocked.
+    file_locks: std::collections::HashMap<u64, FakeFileLockHolders>,
+    file_lock_waiters: Vec<futures::channel::oneshot::Sender<()>>,
 }
 
 #[cfg(feature = "test-support")]
-impl FakeFsState {
-    fn create_file_before_watch_add(&mut self, watch_path: &Path) -> Result<()> {
-        let Some((pending_watch_path, file_path)) = self.file_to_create_before_watch_add.take()
-        else {
-            return Ok(());
-        };
-        if pending_watch_path != watch_path {
-            self.file_to_create_before_watch_add = Some((pending_watch_path, file_path));
-            return Ok(());
-        }
+#[derive(Default)]
+struct FakeFileLockHolders {
+    shared: usize,
+    exclusive: bool,
+}
 
-        let inode = self.get_and_increment_inode();
-        let mtime = self.get_and_increment_mtime();
-        self.write_path(&file_path, |entry| {
-            let btree_map::Entry::Vacant(entry) = entry else {
-                anyhow::bail!("file already exists: {}", file_path.display());
-            };
-            entry.insert(FakeFsEntry::File {
-                inode,
-                mtime,
-                len: 0,
-                content: Vec::new(),
-                git_dir_path: None,
-            });
-            Ok(())
-        })?;
-        self.emit_event([(file_path, Some(PathEventKind::Created))]);
-        Ok(())
+#[cfg(feature = "test-support")]
+struct FakeFileLock {
+    state: Arc<Mutex<FakeFsState>>,
+    inode: u64,
+    kind: FileLockKind,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for FakeFileLock {
+    fn drop(&mut self) {
+        self.state.lock().release_file_lock(self.inode, self.kind);
     }
+}
+
+/// The kernel's side of file watching, as far as the real watcher code above
+/// notify can tell: the paths the backend has registered and the callback that
+/// delivers events for them into the native `OsWatcher`.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct FakeWatches {
+    registered_paths: Vec<PathBuf>,
+    watch_calls: Vec<PathBuf>,
+    event_sink: Option<Box<dyn Fn(notify::Result<notify::Event>) + Send + Sync>>,
+    /// A file to create, without an event, when the given path is next watched.
+    file_to_create_on_watch: Option<(PathBuf, PathBuf)>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1521,7 +1750,20 @@ impl FakeFsState {
                     Component::Normal(name) => {
                         let current_entry = *entry_stack.last()?;
                         if let FakeFsEntry::Dir { entries, .. } = current_entry {
-                            let entry = entries.get(name.to_str().unwrap())?;
+                            let name_str = name.to_str().unwrap();
+                            let (canonical_name, entry) = match entries.get(name_str) {
+                                Some(entry) => (name_str, entry),
+                                None => {
+                                    if !self.case_sensitive {
+                                        entries
+                                            .iter()
+                                            .find(|(key, _)| key.eq_ignore_ascii_case(name_str))
+                                            .map(|(key, entry)| (key.as_str(), entry))?
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                            };
                             if (path_components.peek().is_some() || follow_symlink)
                                 && let FakeFsEntry::Symlink { target, .. } = entry
                             {
@@ -1531,7 +1773,7 @@ impl FakeFsState {
                                 continue 'outer;
                             }
                             entry_stack.push(entry);
-                            canonical_path = canonical_path.join(name);
+                            canonical_path = canonical_path.join(canonical_name);
                         } else {
                             return None;
                         }
@@ -1591,7 +1833,7 @@ impl FakeFsState {
         Ok(self
             .try_entry(target, true)
             .ok_or_else(|| {
-                anyhow!(io::Error::new(
+                anyhow::anyhow!(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("not found: {target:?}")
                 ))
@@ -1614,6 +1856,92 @@ impl FakeFsState {
         callback(new_entry)
     }
 
+    /// Returns the inode of the file that locking `path` locks, creating it if needed.
+    fn lock_file_inode(&mut self, path: &Path) -> Result<u64> {
+        if let Some((entry, _)) = self.try_entry(path, true) {
+            return match entry {
+                FakeFsEntry::File { inode, .. } => Ok(*inode),
+                _ => anyhow::bail!("cannot lock {path:?}: not a file"),
+            };
+        }
+
+        // Like opening one, locking a symlink whose target doesn't exist creates the target.
+        let mut file_path = path.to_path_buf();
+        while let Some((FakeFsEntry::Symlink { target }, symlink_path)) =
+            self.try_entry(&file_path, false)
+        {
+            file_path = match symlink_path.parent() {
+                Some(parent) => parent.join(target),
+                None => target.clone(),
+            };
+        }
+        // A `..` applies to the directory that the symlinks before it lead to, so the
+        // directory is resolved through them rather than by normalizing the path.
+        let file_name = file_path
+            .file_name()
+            .with_context(|| format!("cannot lock {path:?}: not a file"))?;
+        let directory = file_path
+            .parent()
+            .and_then(|parent| self.canonicalize(parent, true))
+            .with_context(|| format!("cannot lock {path:?}: its directory doesn't exist"))?;
+        let file_path = directory.join(file_name);
+
+        let inode = self.get_and_increment_inode();
+        let mtime = self.get_and_increment_mtime();
+        self.write_path(&file_path, |entry| match entry {
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(FakeFsEntry::File {
+                    inode,
+                    mtime,
+                    len: 0,
+                    content: Vec::new(),
+                    git_dir_path: None,
+                });
+                Ok(())
+            }
+            btree_map::Entry::Occupied(_) => anyhow::bail!("cannot lock {path:?}: not a file"),
+        })?;
+        self.emit_event([(file_path, Some(PathEventKind::Created))]);
+        Ok(inode)
+    }
+
+    /// Returns whether the lock was taken.
+    fn try_lock_inode(&mut self, inode: u64, kind: FileLockKind) -> bool {
+        let holders = self.file_locks.entry(inode).or_default();
+        let conflicts = match kind {
+            FileLockKind::Shared => holders.exclusive,
+            FileLockKind::Exclusive => holders.exclusive || holders.shared > 0,
+        };
+        if conflicts {
+            return false;
+        }
+        match kind {
+            FileLockKind::Shared => holders.shared += 1,
+            FileLockKind::Exclusive => holders.exclusive = true,
+        }
+        true
+    }
+
+    fn release_file_lock(&mut self, inode: u64, kind: FileLockKind) {
+        if let std::collections::hash_map::Entry::Occupied(mut holders) =
+            self.file_locks.entry(inode)
+        {
+            match kind {
+                FileLockKind::Shared => {
+                    holders.get_mut().shared = holders.get().shared.saturating_sub(1);
+                }
+                FileLockKind::Exclusive => holders.get_mut().exclusive = false,
+            }
+            if holders.get().shared == 0 && !holders.get().exclusive {
+                holders.remove();
+            }
+        }
+        for waiter in self.file_lock_waiters.drain(..) {
+            // A waiter that stopped waiting has dropped its receiver.
+            waiter.send(()).ok();
+        }
+    }
+
     fn emit_event<I, T>(&mut self, paths: I)
     where
         I: IntoIterator<Item = (T, Option<PathEventKind>)>,
@@ -1631,12 +1959,96 @@ impl FakeFsState {
     }
 
     fn flush_events(&mut self, mut count: usize) {
+        use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind};
+
         count = count.min(self.buffered_events.len());
         let events = self.buffered_events.drain(0..count).collect::<Vec<_>>();
-        self.event_txs.retain(|(_, tx)| {
-            let _ = tx.try_send(events.clone());
-            !tx.is_closed()
-        });
+        let Some(event_sink) = &self.watches.event_sink else {
+            return;
+        };
+        for event in events {
+            let is_registered = self.watches.registered_paths.iter().any(|registered_path| {
+                if self.case_sensitive {
+                    event.path.starts_with(registered_path)
+                } else {
+                    let event_path = event.path.to_string_lossy().to_lowercase();
+                    let registered_path = registered_path.to_string_lossy().to_lowercase();
+                    Path::new(&event_path).starts_with(Path::new(&registered_path))
+                }
+            });
+            if !is_registered {
+                continue;
+            }
+            let notify_event = match event.kind {
+                Some(PathEventKind::Created) => {
+                    notify::Event::new(notify::EventKind::Create(CreateKind::Any))
+                }
+                Some(PathEventKind::Changed) => {
+                    notify::Event::new(notify::EventKind::Modify(ModifyKind::Any))
+                }
+                Some(PathEventKind::Removed) => {
+                    notify::Event::new(notify::EventKind::Remove(RemoveKind::Any))
+                }
+                Some(PathEventKind::Rescan) => {
+                    notify::Event::new(notify::EventKind::Other).set_flag(Flag::Rescan)
+                }
+                None => notify::Event::new(notify::EventKind::Any),
+            };
+            event_sink(Ok(notify_event.add_path(event.path)));
+        }
+    }
+}
+
+/// Stands in for notify at the boundary the real watcher code talks to: the
+/// fake filesystem's own mutations are the "kernel" events.
+#[cfg(feature = "test-support")]
+struct FakeWatchBackend {
+    state: Arc<Mutex<FakeFsState>>,
+}
+
+#[cfg(feature = "test-support")]
+impl fs_watcher::WatchBackend for FakeWatchBackend {
+    fn watch(&mut self, path: &Path, _mode: notify::RecursiveMode) -> notify::Result<()> {
+        let path = normalize_path(path);
+        let mut state = self.state.try_lock().expect(
+            "fake filesystem state is locked; this execution would have caused a test hang",
+        );
+        state.watches.watch_calls.push(path.clone());
+        if let Some((_, file_path)) = state
+            .watches
+            .file_to_create_on_watch
+            .take_if(|(watch_path, _)| *watch_path == path)
+        {
+            let inode = state.get_and_increment_inode();
+            let mtime = state.get_and_increment_mtime();
+            state
+                .write_path(&file_path, |entry| {
+                    let btree_map::Entry::Vacant(entry) = entry else {
+                        anyhow::bail!("file already exists: {}", file_path.display());
+                    };
+                    entry.insert(FakeFsEntry::File {
+                        inode,
+                        mtime,
+                        len: 0,
+                        content: Vec::new(),
+                        git_dir_path: None,
+                    });
+                    Ok(())
+                })
+                .map_err(|error| notify::Error::generic(&error.to_string()))?;
+        }
+        state.watches.registered_paths.push(path);
+        Ok(())
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        let path = normalize_path(path);
+        self.state
+            .lock()
+            .watches
+            .registered_paths
+            .retain(|registered_path| *registered_path != path);
+        Ok(())
     }
 }
 
@@ -1651,50 +2063,54 @@ impl FakeFs {
     const SYSTEMTIME_INTERVAL: Duration = Duration::from_nanos(100);
 
     pub fn new(executor: gpui::BackgroundExecutor) -> Arc<Self> {
-        let (tx, rx) = async_channel::bounded::<PathBuf>(10);
+        let state = Arc::new(Mutex::new(FakeFsState {
+            root: FakeFsEntry::Dir {
+                inode: 0,
+                mtime: MTime(UNIX_EPOCH),
+                len: 0,
+                entries: Default::default(),
+                git_repo_state: None,
+            },
+            next_mtime: UNIX_EPOCH + Self::SYSTEMTIME_INTERVAL,
+            next_inode: 1,
+            watch_roots: Vec::new(),
+            watches: FakeWatches::default(),
+            buffered_events: Vec::new(),
+            events_paused: false,
+            read_dir_call_count: 0,
+            metadata_call_count: 0,
+            read_dir_hooks: Default::default(),
+            path_write_counts: Default::default(),
+            job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
+            trash: Mutex::new(SlotMap::with_key()),
+            remove_dir_errors: Default::default(),
+            case_sensitive: true,
+            file_locks: Default::default(),
+            file_lock_waiters: Vec::new(),
+        }));
+        let native_watcher = fs_watcher::OsWatcher::with_backend(
+            fs_watcher::OsWatcherKind::Native,
+            executor.clone(),
+            Some(Box::new(FakeWatchBackend {
+                state: state.clone(),
+            })),
+        );
+        state.lock().watches.event_sink = Some(Box::new(native_watcher.event_sink()));
+        let poll_watcher =
+            fs_watcher::OsWatcher::new(fs_watcher::OsWatcherKind::Poll, executor.clone());
 
-        let this = Arc::new_cyclic(|this| Self {
+        Arc::new_cyclic(|this| Self {
             this: this.clone(),
             executor: executor.clone(),
-            state: Arc::new(Mutex::new(FakeFsState {
-                root: FakeFsEntry::Dir {
-                    inode: 0,
-                    mtime: MTime(UNIX_EPOCH),
-                    len: 0,
-                    entries: Default::default(),
-                    git_repo_state: None,
-                },
-                git_event_tx: tx,
-                next_mtime: UNIX_EPOCH + Self::SYSTEMTIME_INTERVAL,
-                next_inode: 1,
-                event_txs: Default::default(),
-                buffered_events: Vec::new(),
-                events_paused: false,
-                read_dir_call_count: 0,
-                metadata_call_count: 0,
-                path_write_counts: Default::default(),
-                moves: Default::default(),
-                job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
-                trash: Mutex::new(SlotMap::with_key()),
-                file_to_create_before_watch_add: None,
-                remove_dir_errors: Default::default(),
-            })),
-        });
+            state,
+            native_watcher,
+            poll_watcher,
+        })
+    }
 
-        executor.spawn({
-            let this = this.clone();
-            async move {
-                while let Ok(git_event) = rx.recv().await {
-                    if let Some(mut state) = this.state.try_lock() {
-                        state.emit_event([(git_event, Some(PathEventKind::Changed))]);
-                    } else {
-                        panic!("Failed to lock file system state, this execution would have caused a test hang");
-                    }
-                }
-            }
-        }).detach();
-
-        this
+    /// Configures whether the fake filesystem reports as case-sensitive.
+    pub fn set_case_sensitive(&self, case_sensitive: bool) {
+        self.state.lock().case_sensitive = case_sensitive;
     }
 
     pub fn set_next_mtime(&self, next_mtime: SystemTime) {
@@ -1853,12 +2269,47 @@ impl FakeFs {
         self.state.lock().buffered_events.clear();
     }
 
+    /// Simulates the kernel's watch queue overflowing: all buffered
+    /// (undelivered) events are lost, and the watcher reports only a single
+    /// `Rescan` event for `root`, mirroring how the native backends report
+    /// lost sync (FSEvents `kFSEventStreamEventFlagMustScanSubDirs`, inotify
+    /// `IN_Q_OVERFLOW`, Windows `ERROR_NOTIFY_ENUM_DIR`).
+    ///
+    /// Note that the fake file system's state is unaffected; like a real
+    /// overflow, only the notifications are lost, not the changes themselves.
+    pub fn simulate_watcher_overflow(&self, root: impl Into<PathBuf>) {
+        let mut state = self.state.lock();
+        state.buffered_events.clear();
+        state.emit_event([(root, Some(PathEventKind::Rescan))]);
+    }
+
+    /// Every path the watcher backend has been asked to watch, in order,
+    /// including paths that were later unwatched.
+    pub fn watch_calls(&self) -> Vec<PathBuf> {
+        self.state.lock().watches.watch_calls.clone()
+    }
+
+    /// The paths currently registered with the watcher backend.
+    pub fn registered_watch_paths(&self) -> Vec<PathBuf> {
+        self.state.lock().watches.registered_paths.clone()
+    }
+
+    /// Runs once, immediately before the next `read_dir` resolves `path`.
+    pub fn before_read_dir(&self, path: impl AsRef<Path>, hook: BoxFuture<'static, ()>) {
+        self.state
+            .lock()
+            .read_dir_hooks
+            .insert(normalize_path(path.as_ref()), hook);
+    }
+
+    /// Creates `path` without emitting an event when `watch_path` is next
+    /// watched, simulating a change that lands while the watch is installed.
     pub fn create_file_before_next_watch_add(
         &self,
         watch_path: impl AsRef<Path>,
         path: impl AsRef<Path>,
     ) {
-        self.state.lock().file_to_create_before_watch_add = Some((
+        self.state.lock().watches.file_to_create_on_watch = Some((
             normalize_path(watch_path.as_ref()),
             normalize_path(path.as_ref()),
         ));
@@ -1961,13 +2412,12 @@ impl FakeFs {
         F: FnOnce(&mut FakeGitRepositoryState, &Path, &Path) -> T,
     {
         let mut state = self.state.lock();
-        let git_event_tx = state.git_event_tx.clone();
         let entry = state.entry(dot_git).context("open .git")?;
 
         if let FakeFsEntry::Dir { git_repo_state, .. } = entry {
             let repo_state = git_repo_state.get_or_insert_with(|| {
                 log::debug!("insert git state for {dot_git:?}");
-                Arc::new(Mutex::new(FakeGitRepositoryState::new(git_event_tx)))
+                Arc::new(Mutex::new(FakeGitRepositoryState::new()))
             });
             let mut repo_state = repo_state.lock();
 
@@ -2024,9 +2474,8 @@ impl FakeFs {
             } else {
                 canonical_path.clone()
             };
-            let repo_state = git_repo_state.get_or_insert_with(|| {
-                Arc::new(Mutex::new(FakeGitRepositoryState::new(git_event_tx)))
-            });
+            let repo_state = git_repo_state
+                .get_or_insert_with(|| Arc::new(Mutex::new(FakeGitRepositoryState::new())));
             let mut repo_state = repo_state.lock();
 
             let result = f(&mut repo_state, &canonical_path, &common_dir);
@@ -2227,7 +2676,7 @@ impl FakeFs {
             state.index_contents.extend(
                 index_state
                     .iter()
-                    .map(|(path, content)| (repo_path(path), content.clone())),
+                    .map(|(path, content)| (repo_path(path), content.as_bytes().to_vec())),
             );
         })
         .unwrap();
@@ -2244,7 +2693,7 @@ impl FakeFs {
             state.head_contents.extend(
                 head_state
                     .iter()
-                    .map(|(path, content)| (repo_path(path), content.clone())),
+                    .map(|(path, content)| (repo_path(path), content.as_bytes().to_vec())),
             );
             state.refs.insert("HEAD".into(), sha.into());
         })
@@ -2257,7 +2706,7 @@ impl FakeFs {
             state.head_contents.extend(
                 contents_by_path
                     .iter()
-                    .map(|(path, contents)| (repo_path(path), contents.clone())),
+                    .map(|(path, contents)| (repo_path(path), contents.as_bytes().to_vec())),
             );
             state.index_contents = state.head_contents.clone();
         })
@@ -2268,20 +2717,32 @@ impl FakeFs {
         &self,
         dot_git: &Path,
         contents_by_path: &[(&str, String)],
-    ) {
+    ) -> Vec<git::Oid> {
         self.with_git_state(dot_git, true, |state| {
             use git::Oid;
 
             state.merge_base_contents.clear();
-            let oids = (1..)
-                .map(|n| n.to_string())
-                .map(|n| Oid::from_bytes(n.repeat(20).as_bytes()).unwrap());
-            for ((path, content), oid) in contents_by_path.iter().zip(oids) {
+            let mut assigned = Vec::with_capacity(contents_by_path.len());
+            for (index, (path, content)) in contents_by_path.iter().enumerate() {
+                let mut bytes = [0u8; 20];
+                bytes[..4].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+                let oid = Oid::from_bytes(&bytes).unwrap();
                 state.merge_base_contents.insert(repo_path(path), oid);
-                state.oids.insert(oid, content.clone());
+                state.oids.insert(oid, content.as_bytes().to_vec());
+                assigned.push(oid);
             }
+            assigned
+        })
+        .unwrap()
+    }
+
+    pub fn install_blob_read_gate_for_repo(&self, dot_git: &Path) -> FakeBlobReadGate {
+        let gate = FakeBlobReadGate::default();
+        self.with_git_state(dot_git, false, |state| {
+            state.blob_read_gate = Some(gate.clone());
         })
         .unwrap();
+        gate
     }
 
     pub fn set_blame_for_repo(&self, dot_git: &Path, blames: Vec<(RepoPath, git::blame::Blame)>) {
@@ -2405,10 +2866,14 @@ impl FakeFs {
                 };
 
                 if let Some(content) = index_content {
-                    state.index_contents.insert(repo_path.clone(), content);
+                    state
+                        .index_contents
+                        .insert(repo_path.clone(), content.into_bytes());
                 }
                 if let Some(content) = head_content {
-                    state.head_contents.insert(repo_path.clone(), content);
+                    state
+                        .head_contents
+                        .insert(repo_path.clone(), content.into_bytes());
                 }
             }
         }).unwrap();
@@ -2421,19 +2886,19 @@ impl FakeFs {
         .unwrap();
     }
 
-    pub fn set_create_worktree_error(&self, dot_git: &Path, message: Option<String>) {
-        self.with_git_state(dot_git, true, |state| {
-            state.simulated_create_worktree_error = message;
-        })
-        .unwrap();
-    }
-
     /// Makes subsequent `remove_dir` calls for `path` fail with `message`.
     pub fn set_remove_dir_error(&self, path: impl AsRef<Path>, message: String) {
         self.state
             .lock()
             .remove_dir_errors
             .insert(Self::remove_dir_error_key(path.as_ref()), message);
+    }
+
+    pub fn clear_remove_dir_error(&self, path: impl AsRef<Path>) {
+        self.state
+            .lock()
+            .remove_dir_errors
+            .remove(&Self::remove_dir_error_key(path.as_ref()));
     }
 
     /// Entry resolution in `try_entry` ignores drive prefixes, so the error
@@ -2538,12 +3003,13 @@ impl FakeFs {
         self.state.lock().read_dir_call_count
     }
 
+    /// The roots passed to `Fs::watch` whose watchers are still alive.
     pub fn watched_paths(&self) -> Vec<PathBuf> {
         let state = self.state.lock();
         state
-            .event_txs
+            .watch_roots
             .iter()
-            .filter_map(|(path, tx)| Some(path.clone()).filter(|_| !tx.is_closed()))
+            .filter_map(|(path, watcher)| (watcher.strong_count() > 0).then_some(path.clone()))
             .collect()
     }
 
@@ -2569,6 +3035,14 @@ impl FakeFs {
 
     fn simulate_random_delay(&self) -> impl futures::Future<Output = ()> {
         self.executor.simulate_random_delay()
+    }
+
+    fn held_file_lock(&self, inode: u64, kind: FileLockKind) -> FileLock {
+        FileLock::new(FakeFileLock {
+            state: self.state.clone(),
+            inode,
+            kind,
+        })
     }
 
     async fn remove_dir_inner(
@@ -2643,8 +3117,13 @@ impl FakeFs {
 
                 None
             }
-            btree_map::Entry::Occupied(mut entry) => {
-                entry.get_mut().file_content(&path)?;
+            btree_map::Entry::Occupied(entry) => {
+                // Like `unlink`, removing a symlink removes the link itself.
+                if let entry = entry.get()
+                    && !entry.is_symlink()
+                {
+                    entry.file_content(&path)?;
+                }
                 Some(entry.remove())
             }
         };
@@ -2696,48 +3175,6 @@ impl FakeFsEntry {
 }
 
 #[cfg(feature = "test-support")]
-struct FakeWatcher {
-    tx: async_channel::Sender<Vec<PathEvent>>,
-    fs_state: Arc<Mutex<FakeFsState>>,
-    prefixes: Mutex<Vec<PathBuf>>,
-}
-
-#[cfg(feature = "test-support")]
-impl Watcher for FakeWatcher {
-    fn add(&self, path: &Path) -> Result<()> {
-        let path = normalize_path(path);
-        self.fs_state
-            .try_lock()
-            .unwrap()
-            .create_file_before_watch_add(&path)?;
-
-        let mut prefixes = self.prefixes.lock();
-        if prefixes.iter().any(|prefix| path.starts_with(prefix)) {
-            return Ok(());
-        }
-
-        self.fs_state
-            .try_lock()
-            .unwrap()
-            .event_txs
-            .push((path.clone(), self.tx.clone()));
-        prefixes.push(path);
-        Ok(())
-    }
-
-    fn remove(&self, path: &Path) -> Result<()> {
-        let path = normalize_path(path);
-        self.prefixes.lock().retain(|prefix| prefix != &path);
-        self.fs_state
-            .try_lock()
-            .unwrap()
-            .event_txs
-            .retain(|(watched_path, _)| watched_path != &path);
-        Ok(())
-    }
-}
-
-#[cfg(feature = "test-support")]
 #[derive(Debug)]
 struct FakeHandle {
     inode: u64,
@@ -2747,13 +3184,23 @@ struct FakeHandle {
 impl FileHandle for FakeHandle {
     fn current_path(&self, fs: &Arc<dyn Fs>) -> Result<PathBuf> {
         let fs = fs.as_fake();
-        let mut state = fs.state.lock();
-        let Some(target) = state.moves.get(&self.inode).cloned() else {
-            anyhow::bail!("fake fd not moved")
-        };
-
-        if state.try_entry(&target, false).is_some() {
-            return Ok(target);
+        let state = fs.state.lock();
+        let mut queue = collections::VecDeque::new();
+        queue.push_back((PathBuf::from(util::path!("/")), &state.root));
+        while let Some((path, entry)) = queue.pop_front() {
+            match entry {
+                FakeFsEntry::File { inode, .. } | FakeFsEntry::Dir { inode, .. }
+                    if *inode == self.inode =>
+                {
+                    return Ok(path);
+                }
+                FakeFsEntry::Dir { entries, .. } => {
+                    for (name, entry) in entries {
+                        queue.push_back((path.join(name), entry));
+                    }
+                }
+                _ => {}
+            }
         }
         anyhow::bail!("fake fd target not found")
     }
@@ -2801,7 +3248,7 @@ impl Fs for FakeFs {
         let mut state = self.state.lock();
         let inode = state.get_and_increment_inode();
         let mtime = state.get_and_increment_mtime();
-        let file = FakeFsEntry::File {
+        let mut file = FakeFsEntry::File {
             inode,
             mtime,
             len: 0,
@@ -2814,6 +3261,17 @@ impl Fs for FakeFs {
                 btree_map::Entry::Occupied(mut e) => {
                     if options.overwrite {
                         kind = Some(PathEventKind::Changed);
+                        // Truncating a file keeps its inode, and with it the locks on it.
+                        if let (
+                            FakeFsEntry::File { inode, .. },
+                            FakeFsEntry::File {
+                                inode: existing_inode,
+                                ..
+                            },
+                        ) = (&mut file, e.get())
+                        {
+                            *inode = *existing_inode;
+                        }
                         *e.get_mut() = file;
                     } else if !options.ignore_if_exists {
                         anyhow::bail!("path already exists: {path:?}");
@@ -2900,21 +3358,31 @@ impl Fs for FakeFs {
             }
         })?;
 
-        let inode = match moved_entry {
-            FakeFsEntry::File { inode, .. } => inode,
-            FakeFsEntry::Dir { inode, .. } => inode,
-            _ => 0,
-        };
+        // POSIX `rename` succeeds without doing anything when both names resolve
+        // to the same file. Falling through would assign the entry onto itself
+        // and then remove it, destroying the file. The lookup above has already
+        // reported a missing source, so only an existing one reaches here.
+        if old_path == new_path {
+            return Ok(());
+        }
 
-        state.moves.insert(inode, new_path.clone());
-
+        let mut moved = true;
         state.write_path(&new_path, |e| {
             match e {
                 btree_map::Entry::Occupied(mut e) => {
                     if options.overwrite {
                         *e.get_mut() = moved_entry;
-                    } else if !options.ignore_if_exists {
-                        anyhow::bail!("path already exists: {new_path:?}");
+                    } else if options.ignore_if_exists {
+                        // `RealFs` reports success without moving anything here,
+                        // leaving the source in place. Removing it instead would
+                        // destroy a file the caller still expects to find.
+                        moved = false;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("path already exists: {new_path:?}"),
+                        )
+                        .into());
                     }
                 }
                 btree_map::Entry::Vacant(e) => {
@@ -2923,6 +3391,10 @@ impl Fs for FakeFs {
             }
             Ok(())
         })?;
+
+        if !moved {
+            return Ok(());
+        }
 
         state
             .write_path(&old_path, |e| {
@@ -2948,33 +3420,42 @@ impl Fs for FakeFs {
         let target = normalize_path(target);
         let mut state = self.state.lock();
         let mtime = state.get_and_increment_mtime();
-        let inode = state.get_and_increment_inode();
+        let new_inode = state.get_and_increment_inode();
         let source_entry = state.entry(&source)?;
         let content = source_entry.file_content(&source)?.clone();
-        let mut kind = Some(PathEventKind::Created);
-        state.write_path(&target, |e| match e {
-            btree_map::Entry::Occupied(e) => {
-                if options.overwrite {
-                    kind = Some(PathEventKind::Changed);
-                    Ok(Some(e.get().clone()))
-                } else if !options.ignore_if_exists {
+        let new_entry = move |inode| FakeFsEntry::File {
+            inode,
+            mtime,
+            len: content.len() as u64,
+            content,
+            git_dir_path: None,
+        };
+
+        let kind = state.write_path(&target, |e| match e {
+            btree_map::Entry::Occupied(mut e) => {
+                if !options.overwrite {
+                    if options.ignore_if_exists {
+                        return Ok(None);
+                    }
                     anyhow::bail!("{target:?} already exists");
-                } else {
-                    Ok(None)
                 }
+                let inode = match e.get() {
+                    FakeFsEntry::File { inode, .. } => *inode,
+                    FakeFsEntry::Dir { .. } => anyhow::bail!("{target:?} is a directory"),
+                    FakeFsEntry::Symlink { .. } => new_inode,
+                };
+                e.insert(new_entry(inode));
+                Ok(Some(PathEventKind::Changed))
             }
-            btree_map::Entry::Vacant(e) => Ok(Some(
-                e.insert(FakeFsEntry::File {
-                    inode,
-                    mtime,
-                    len: content.len() as u64,
-                    content,
-                    git_dir_path: None,
-                })
-                .clone(),
-            )),
+            btree_map::Entry::Vacant(e) => {
+                e.insert(new_entry(new_inode));
+                Ok(Some(PathEventKind::Created))
+            }
         })?;
-        state.emit_event([(target, kind)]);
+
+        if let Some(kind) = kind {
+            state.emit_event([(target, Some(kind))]);
+        }
         Ok(())
     }
 
@@ -3017,7 +3498,35 @@ impl Fs for FakeFs {
         self.remove_file_inner(path, options).await.map(|_| ())
     }
 
-    async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read + Send + Sync>> {
+    async fn lock_file(&self, path: &Path, kind: FileLockKind) -> Result<FileLock> {
+        self.simulate_random_delay().await;
+        let inode = self.state.lock().lock_file_inode(path)?;
+        loop {
+            let released = {
+                let mut state = self.state.lock();
+                if state.try_lock_inode(inode, kind) {
+                    return Ok(self.held_file_lock(inode, kind));
+                }
+                let (released_sender, released_receiver) = futures::channel::oneshot::channel();
+                state.file_lock_waiters.push(released_sender);
+                released_receiver
+            };
+            // Whether or not a lock was released, the next attempt decides.
+            released.await.ok();
+        }
+    }
+
+    async fn try_lock_file(&self, path: &Path, kind: FileLockKind) -> Result<Option<FileLock>> {
+        self.simulate_random_delay().await;
+        let (inode, locked) = {
+            let mut state = self.state.lock();
+            let inode = state.lock_file_inode(path)?;
+            (inode, state.try_lock_inode(inode, kind))
+        };
+        Ok(locked.then(|| self.held_file_lock(inode, kind)))
+    }
+
+    async fn open_sync(&self, path: &Path) -> Result<Box<dyn ReadSeek + Send + Sync>> {
         let bytes = self.load_internal(path).await?;
         Ok(Box::new(io::Cursor::new(bytes)))
     }
@@ -3167,6 +3676,10 @@ impl Fs for FakeFs {
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>> {
         self.simulate_random_delay().await;
         let path = normalize_path(path);
+        let hook = self.state.lock().read_dir_hooks.remove(&path);
+        if let Some(hook) = hook {
+            hook.await;
+        }
         let mut state = self.state.lock();
         state.read_dir_call_count += 1;
         let entry = state.entry(&path)?;
@@ -3187,35 +3700,22 @@ impl Fs for FakeFs {
         Arc<dyn Watcher>,
     ) {
         self.simulate_random_delay().await;
-        let (tx, rx) = async_channel::unbounded();
-        let path = path.to_path_buf();
-        self.state.lock().event_txs.push((path.clone(), tx.clone()));
-        let executor = self.executor.clone();
-        let watcher = Arc::new(FakeWatcher {
-            tx,
-            fs_state: self.state.clone(),
-            prefixes: Mutex::new(vec![path]),
-        });
-        (
-            Box::pin(futures::StreamExt::filter(rx, {
-                let watcher = watcher.clone();
-                move |events| {
-                    let result = events.iter().any(|evt_path| {
-                        watcher
-                            .prefixes
-                            .lock()
-                            .iter()
-                            .any(|prefix| evt_path.path.starts_with(prefix))
-                    });
-                    let executor = executor.clone();
-                    async move {
-                        executor.simulate_random_delay().await;
-                        result
-                    }
-                }
-            })),
-            watcher,
+        // Zero latency: the deterministic executor doesn't advance time on its
+        // own, so a real debounce would stall every test until `advance_clock`.
+        let (events, watcher) = fs_watcher::watch(
+            self.this.upgrade().unwrap(),
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+            self.executor.clone(),
+            path,
+            Duration::ZERO,
         )
+        .await;
+        self.state
+            .lock()
+            .watch_roots
+            .push((normalize_path(path), Arc::downgrade(&watcher)));
+        (events, watcher)
     }
 
     fn open_repo(
@@ -3256,12 +3756,34 @@ impl Fs for FakeFs {
         anyhow::bail!("Git config is not supported in fake Fs")
     }
 
+    fn record_watcher_diagnostics(&self) -> Option<fs_watcher::WatchRecording> {
+        Some(fs_watcher::WatchRecording::new([
+            self.native_watcher.clone(),
+            self.poll_watcher.clone(),
+        ]))
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        self.state
+            .lock()
+            .try_entry(&normalize_path(path), false)
+            .is_some()
+    }
+
+    fn is_path_case_sensitive(&self, _path: &Path) -> bool {
+        self.state.lock().case_sensitive
+    }
+
+    fn requires_poll_watcher(&self, _path: &Path) -> bool {
+        false
+    }
+
     fn is_fake(&self) -> bool {
         true
     }
 
     async fn is_case_sensitive(&self) -> bool {
-        true
+        self.state.lock().case_sensitive
     }
 
     fn subscribe_to_jobs(&self) -> JobEventReceiver {
@@ -3270,10 +3792,19 @@ impl Fs for FakeFs {
         receiver
     }
 
+    fn original_path_for_trash_id(&self, trash_id: TrashId) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .trash
+            .lock()
+            .get(trash_id)
+            .map(|(entry, _)| entry.original_parent.join(&entry.name))
+    }
+
     async fn restore(&self, trash_id: TrashId) -> Result<PathBuf, TrashRestoreError> {
         let mut state = self.state.lock();
 
-        let Some((trashed_entry, fake_entry)) = state.trash.lock().remove(trash_id) else {
+        let Some((trashed_entry, fake_entry)) = state.trash.lock().get(trash_id).cloned() else {
             return Err(TrashRestoreError::AlreadyRestored);
         };
 
@@ -3293,6 +3824,7 @@ impl Fs for FakeFs {
 
         match result {
             Ok(_) => {
+                state.trash.lock().remove(trash_id);
                 state.emit_event([(path.clone(), Some(PathEventKind::Created))]);
                 Ok(path)
             }

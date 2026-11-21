@@ -496,7 +496,7 @@ impl Database {
                 .exec(&*tx)
                 .await?;
             if participant_update.rows_affected == 0 {
-                return Err(anyhow!("room does not exist or was already joined"))?;
+                Err(anyhow!("room does not exist or was already joined"))?;
             }
 
             let mut reshared_projects = Vec::new();
@@ -507,7 +507,7 @@ impl Database {
                     .await?
                     .context("project does not exist")?;
                 if project.host_user_id != Some(user_id) {
-                    return Err(anyhow!("no such project"))?;
+                    Err(anyhow!("no such project"))?;
                 }
 
                 let mut collaborators = project
@@ -679,6 +679,7 @@ impl Database {
                             // on number of files only. That shouldn't be a huge deal in practice.
                             size: None,
                             is_fifo: db_entry.is_fifo,
+                            is_unloaded: db_entry.is_unloaded,
                         });
                     }
                 }
@@ -739,7 +740,7 @@ impl Database {
                     while let Some(db_status) = db_statuses.next().await {
                         let db_status: project_repository_statuses::Model = db_status?;
                         if db_status.is_deleted {
-                            removed_statuses.push(db_status.repo_path.clone());
+                            removed_statuses.push(db_status.repo_path);
                         } else {
                             updated_statuses.push(db_status_to_proto(db_status)?);
                         }

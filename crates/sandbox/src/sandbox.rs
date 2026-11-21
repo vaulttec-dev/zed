@@ -13,11 +13,12 @@ use std::{
     process::Output,
 };
 
+use futures::channel::mpsc::UnboundedSender;
 use http_proxy::ProxyHandle;
 #[cfg(not(target_os = "windows"))]
-use http_proxy::{Allowlist, HostPattern, ProxyConfig, ProxyEvent, UpstreamProxy};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd as _;
+use http_proxy::{Allowlist, HostPattern, ProxyConfig, UpstreamProxy};
+
+pub use http_proxy::{DenyReason, ProxyEvent, RequestMethod, RequestOutcome};
 
 #[cfg(target_os = "linux")]
 mod linux_bubblewrap;
@@ -28,217 +29,21 @@ mod macos_seatbelt;
 #[cfg(target_os = "windows")]
 mod windows_wsl;
 
+mod util;
+
+#[cfg(target_os = "macos")]
+use util::canonicalize_allowing_missing_leaf;
+#[cfg(target_os = "linux")]
+use util::{CanonicalPathBuf, linux_fd_identity};
+pub use util::{
+    HostFilesystemLocation, HostFilesystemLocationDisplay, normalize_host_filesystem_locations,
+    resolve_canonical,
+};
+#[cfg(target_os = "windows")]
+pub use windows_wsl::{ResolvedGrant, resolve_canonical_for_grant};
+
 #[cfg(target_os = "windows")]
 pub(crate) const WSL_SANDBOX_UNAVAILABLE_PREFIX: &str = "Windows sandboxing via WSL is unavailable";
-
-/// An opaque handle to a location on the **host** filesystem the sandbox may
-/// grant access to or protect (for example, a writable or protected subtree).
-///
-/// The entire purpose of this type is to capture the *security-relevant identity*
-/// of a host location once, up front, in a form the enforcement layer can use
-/// without re-resolving a path string later. Re-resolving a path at enforcement
-/// time is the classic time-of-check-to-time-of-use hole: a path that was
-/// verified as safe can be swapped for a symlink before the sandbox actually
-/// binds/allows it, redirecting the grant to an arbitrary host location.
-///
-/// What is captured is platform-specific:
-/// - **macOS**: the fully-canonicalized path, used verbatim as the Seatbelt rule
-///   literal. Seatbelt matches the *resolved* access path against this literal,
-///   so a post-capture swap of a path component fails closed (denied) rather
-///   than redirecting the grant.
-/// - **Linux**: an `O_PATH` file descriptor pinned to the target inode. bwrap is
-///   launched by a PTY that can't inherit extra fds, so we can't use bwrap's own
-///   `--bind-fd`; instead the bind uses an ordinary `--bind <path>` and an
-///   in-sandbox validator compares `fstat` of this descriptor against `lstat` of
-///   the mounted path after the mounts, failing closed on a post-capture swap
-///   (see `linux_bubblewrap::validate_binds` and `README.md`).
-/// - **Windows**: nothing — a Windows process holds no Linux fds, so the real
-///   capture-at-validation happens inside WSL (in the `--wsl-sandbox-helper`),
-///   and the value here carries only the requested path as untrusted intent.
-///
-/// The type is deliberately **opaque**: it does not `Deref`, and it never hands
-/// back its trusted value. The only thing readable is a *display-only* path via
-/// [`HostFilesystemLocation::untrusted_path_display`], suitable for showing a
-/// human but which must never be passed back into a sandbox API as the
-/// location's identity. Equality reflects the actual filesystem object (same
-/// inode), not the textual path.
-#[derive(Clone)]
-pub struct HostFilesystemLocation {
-    /// macOS: the canonicalized path, resolved exactly once at capture time and
-    /// used directly as the Seatbelt rule literal.
-    #[cfg(target_os = "macos")]
-    canonical_path: PathBuf,
-    /// Linux: an `O_PATH` descriptor pinned to the captured inode. Wrapped in an
-    /// `Arc` only so the surrounding policy types can stay `Clone`; cloning
-    /// shares the same underlying descriptor.
-    #[cfg(target_os = "linux")]
-    fd: std::sync::Arc<std::os::fd::OwnedFd>,
-    /// The path exactly as the caller requested it. Kept **only** so the UI can
-    /// show the user which location is being granted. This is never consulted by
-    /// any enforcement path — treat it as untrusted, attacker-influenced text.
-    untrusted_path_for_display: PathBuf,
-}
-
-impl HostFilesystemLocation {
-    /// Capture `path` as a host sandbox location, resolving its identity up front.
-    ///
-    /// On macOS this canonicalizes the path; on Linux it opens an `O_PATH`
-    /// descriptor to it; on Windows it records nothing. The caller is
-    /// responsible for having already *validated* `path` (e.g. confirmed it is
-    /// inside the project, or safe to treat as a protected path) — capturing it here
-    /// pins that decision against later tampering. To be race-free, capture
-    /// should happen as part of, or immediately after, that validation, and the
-    /// resulting value should be passed around unchanged from then on (never
-    /// re-derived from a path).
-    pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        let untrusted_path_for_display = path.to_path_buf();
-
-        #[cfg(target_os = "macos")]
-        {
-            // `canonicalize_allowing_missing_leaf` resolves through the existing
-            // parent so a not-yet-created leaf still yields the real path
-            // Seatbelt will match against.
-            let canonical_path = canonicalize_allowing_missing_leaf(path);
-            Ok(Self {
-                canonical_path,
-                untrusted_path_for_display,
-            })
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // `O_PATH` opens a handle that refers to the inode without granting
-            // read/write on its contents, which is exactly what a bind source
-            // needs. `O_CLOEXEC` keeps the descriptor from leaking into
-            // unrelated children; the bind step re-publishes it deliberately
-            // when launching bwrap.
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-                .open(path)?;
-            Ok(Self {
-                fd: std::sync::Arc::new(std::os::fd::OwnedFd::from(file)),
-                untrusted_path_for_display,
-            })
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            Ok(Self {
-                untrusted_path_for_display,
-            })
-        }
-    }
-
-    /// The requested path, for **display only** (e.g. the permission-request UI).
-    ///
-    /// This intentionally returns the untrusted, as-requested path — never the
-    /// captured trusted identity. Do not feed the result back into any sandbox
-    /// API as if it identified this location.
-    pub fn untrusted_path_display(&self) -> std::path::Display<'_> {
-        self.untrusted_path_for_display.display()
-    }
-
-    /// macOS: the canonical path captured once at construction, used verbatim as
-    /// the Seatbelt rule literal. Trusted — never re-resolved. Falls back to the
-    /// requested path for a display-only location (which must never reach
-    /// enforcement).
-    #[cfg(target_os = "macos")]
-    pub(crate) fn macos_canonical_path(&self) -> &Path {
-        &self.canonical_path
-    }
-
-    /// Linux: a borrowed handle to the pinned inode, for deriving a bind source
-    /// path and for `fstat`-based identity checks.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn linux_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
-        self.fd.as_fd()
-    }
-
-    /// Linux: an independent `O_PATH` descriptor to the same pinned inode,
-    /// duplicated (with `O_CLOEXEC`) so the validation server can own and send it
-    /// over `SCM_RIGHTS` without affecting this location's descriptor.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn linux_dup_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsFd as _;
-        self.fd.as_fd().try_clone_to_owned()
-    }
-
-    /// Windows: the requested path, to be mapped into WSL and handed to the
-    /// in-WSL helper. Windows captures no identity itself (it holds no Linux
-    /// fds); the real capture-at-validation happens WSL-side in the helper, so
-    /// here the requested path *is* the location.
-    #[cfg(target_os = "windows")]
-    pub(crate) fn windows_path(&self) -> &Path {
-        &self.untrusted_path_for_display
-    }
-}
-
-impl fmt::Debug for HostFilesystemLocation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only the display path is shown; the trusted identity stays opaque.
-        formatter
-            .debug_struct("HostFilesystemLocation")
-            .field(
-                "untrusted_path_for_display",
-                &self.untrusted_path_for_display,
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for HostFilesystemLocation {
-    /// Two locations are equal when they refer to the **same filesystem object**,
-    /// determined from the captured identity (the inode behind the `O_PATH` fd on
-    /// Linux, the canonical path on macOS) — never from the textual
-    /// display path. This is what lets policy bookkeeping dedupe "the same
-    /// location named two different ways," and refuse to treat "two different
-    /// objects that happen to share a path string" as one.
-    fn eq(&self, other: &Self) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            match (
-                linux_fd_identity(self.fd.as_raw_fd()),
-                linux_fd_identity(other.fd.as_raw_fd()),
-            ) {
-                (Some(a), Some(b)) => a == b,
-                // An `fstat` on an `O_PATH` fd we own should never fail; if it
-                // somehow does we can't prove identity, so report "not equal"
-                // (the safe answer) and leave a trace.
-                _ => {
-                    log::error!(
-                        "failed to fstat an O_PATH descriptor while comparing sandbox locations"
-                    );
-                    false
-                }
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // Canonicalization is a bijection on real paths, so equal canonical
-            // paths mean the same directory/file.
-            self.canonical_path == other.canonical_path
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            // No enforcement and no captured identity on these platforms; fall
-            // back to the requested path purely so the type can still be used in
-            // collections.
-            self.untrusted_path_for_display == other.untrusted_path_for_display
-        }
-    }
-}
-
-impl Eq for HostFilesystemLocation {}
-
-/// The `(device, inode)` pair behind an `O_PATH` descriptor, used to decide
-/// whether two [`HostFilesystemLocation`]s refer to the same filesystem object.
-#[cfg(target_os = "linux")]
-fn linux_fd_identity(fd: std::os::fd::RawFd) -> Option<(u64, u64)> {
-    let stat = nix::sys::stat::fstat(fd).ok()?;
-    Some((stat.st_dev as u64, stat.st_ino as u64))
-}
 
 /// A path *inside the sandbox* — i.e. where a host location is exposed in the
 /// sandboxed process's view of the filesystem (for example, a bind-mount
@@ -283,24 +88,111 @@ impl From<PathBuf> for SandboxFilesystemLocation {
 pub struct SandboxPolicy {
     pub fs: SandboxFsPolicy,
     pub network: SandboxNetPolicy,
+    /// Unix domain sockets the command may connect to for local IPC even when
+    /// the network is blocked or restricted; connecting to any other Unix
+    /// socket is denied unless the network is unrestricted. A socket grant
+    /// never permits sending packets to other machines.
+    ///
+    /// Only the macOS backend can enforce this. The Linux and WSL backends
+    /// reject any policy that lists a socket.
+    pub allowed_unix_sockets: Vec<HostFilesystemLocation>,
 }
 
 /// Filesystem policy for a sandboxed command.
+///
+/// In both variants, `paths_disallowing_reads` are subtrees the command can
+/// neither read (including listing and `stat`) nor write, even where a
+/// writable path covers them. Each of `paths_allowing_reads` is a subtree the
+/// command can use as if no path disallowing reads covered it: it is readable,
+/// and writable wherever the rest of the policy makes it writable. Protected
+/// paths and protected file names still apply inside it.
+///
+/// Where the two overlap, allowing wins: a path under both a path disallowing
+/// reads and a path allowing reads is readable, however the two are nested.
+/// Because a path disallowing reads would therefore have no effect at or
+/// beneath a path allowing reads, [`Sandbox::new`] rejects such a policy
+/// rather than silently leaving the path readable.
+///
+/// Only the macOS backend can enforce either list. The Linux and WSL backends
+/// reject any policy with an entry in one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SandboxFsPolicy {
-    /// Allow unrestricted filesystem writes except for protected paths, which
-    /// remain readable but not writable.
+    /// Allow unrestricted filesystem writes except for protected paths and
+    /// protected file names, which remain readable but not writable, and
+    /// paths disallowing reads.
     Unrestricted {
         protected_paths: Vec<HostFilesystemLocation>,
+        /// See [`ProtectedFileName`].
+        protected_file_names: Vec<ProtectedFileName>,
+        paths_disallowing_reads: Vec<HostFilesystemLocation>,
+        paths_allowing_reads: Vec<HostFilesystemLocation>,
     },
-    /// Reads are allowed everywhere; writes are confined to these locations
-    /// (and the standard ephemeral locations the platform provides). Each is a
-    /// [`HostFilesystemLocation`] captured at validation time, never a bare path
-    /// the enforcement layer would re-resolve.
+    /// Reads are allowed everywhere except paths disallowing reads; writes are
+    /// confined to these locations (and the standard ephemeral locations the platform
+    /// provides). Each is a [`HostFilesystemLocation`] captured at validation
+    /// time, never a bare path the enforcement layer would re-resolve.
     Restricted {
         writable_paths: Vec<HostFilesystemLocation>,
         protected_paths: Vec<HostFilesystemLocation>,
+        /// See [`ProtectedFileName`].
+        protected_file_names: Vec<ProtectedFileName>,
+        paths_disallowing_reads: Vec<HostFilesystemLocation>,
+        paths_allowing_reads: Vec<HostFilesystemLocation>,
     },
+}
+
+/// A file name whose writes are denied wherever it appears on the filesystem.
+///
+/// Matching is on the final path component only, anywhere on the filesystem,
+/// including in directories that do not exist yet when the sandbox is built.
+/// The match is ASCII case-insensitive, because the default macOS filesystem
+/// is case-insensitive and would otherwise let `.ENVRC` stand in for `.envrc`.
+/// Files of that name stay readable; the sandbox denies creating, writing,
+/// truncating, deleting, renaming onto, and linking (hard or symbolic) to a
+/// path whose final component is the name.
+///
+/// This complements path-based protected paths for files whose consumers look
+/// them up by name, such as direnv's `.envrc`, which is read from the working
+/// directory or any of its ancestors.
+///
+/// Only the macOS backend can enforce this today. The Linux and WSL backends
+/// reject any policy that contains protected file names, pending the planned
+/// Linux syscall-interception backend.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ProtectedFileName(String);
+
+impl ProtectedFileName {
+    /// Validate `name` as a single, non-empty path component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::InvalidRequest`] if `name` is empty, is `.` or
+    /// `..`, or contains `/` or a NUL byte.
+    pub fn new(name: impl Into<String>) -> Result<Self, SandboxError> {
+        let name = name.into();
+        let problem = if name.is_empty() {
+            Some("must not be empty")
+        } else if name == "." || name == ".." {
+            Some("must not be `.` or `..`")
+        } else if name.contains('/') {
+            Some("must not contain `/`")
+        } else if name.contains('\0') {
+            Some("must not contain a NUL byte")
+        } else {
+            None
+        };
+        match problem {
+            Some(problem) => Err(SandboxError::InvalidRequest(format!(
+                "invalid protected file name {name:?}: {problem}"
+            ))),
+            None => Ok(Self(name)),
+        }
+    }
+
+    /// The validated file name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Outbound-network policy for a sandboxed command.
@@ -310,9 +202,22 @@ pub enum SandboxNetPolicy {
     Unrestricted,
     /// Block all outbound network access.
     Blocked,
-    /// Allow outbound HTTP(S) only to these hostnames (exact hosts or
-    /// leading-`*.` subdomain wildcards), enforced by an in-process proxy.
-    Restricted { allowed_domains: Vec<String> },
+    /// Allow outbound HTTP(S) to `allowed_domains` and raw outbound TCP to
+    /// `allowed_tcp_ports`, and nothing else.
+    Restricted {
+        /// Hostnames the command may reach over HTTP(S), as exact hosts or
+        /// leading-`*.` subdomain wildcards, enforced by an in-process proxy.
+        allowed_domains: Vec<String>,
+        /// Destination ports the command may open raw TCP connections to,
+        /// bypassing the proxy, for protocols an HTTP proxy cannot carry (SSH
+        /// on port 22, for example).
+        ///
+        /// A port grant applies to every host: the sandbox cannot filter raw
+        /// TCP by hostname, so granting port 22 allows SSH to any host. Port 0
+        /// is rejected. Only the macOS backend can enforce this; the Linux and
+        /// WSL backends reject any policy that lists a port.
+        allowed_tcp_ports: Vec<u16>,
+    },
 }
 
 /// Host paths that should remain readable but not writable, even when they fall
@@ -321,6 +226,40 @@ pub enum SandboxNetPolicy {
 /// The caller computes this list because the sandbox layer does not know which
 /// application-specific paths need stronger protection.
 pub type ProtectedPaths = Vec<HostFilesystemLocation>;
+
+/// Whether `path` (a host path) resides on a Windows drive reached through WSL's
+/// DrvFs, where sandbox-integrity guarantees are weaker than on the distro's
+/// native filesystem. Always `false` off Windows, where no such filesystem
+/// exists. This is a cheap structural check on the path shape; the authoritative
+/// per-grant classification is done in WSL by [`resolve_canonical_for_grant`].
+pub fn path_is_on_windows_drive(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_wsl::path_is_on_windows_drive(path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether WSL is structurally present (at least one registered distro), via a
+/// cheap registry read with no `wsl.exe` round-trip. Always `false` off
+/// Windows. Suitable only for UI gating (e.g. suppressing DrvFs
+/// sandbox-integrity warnings on machines where no WSL sandbox could ever be
+/// constructed); enforcement paths must keep relying on the real in-WSL probe,
+/// which is authoritative about whether a sandbox can actually be built.
+pub fn wsl_distro_registered() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_wsl::wsl_distro_registered()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
 
 impl SandboxPolicy {
     /// Combine two policy layers. Filesystem/network grants are unioned into the
@@ -331,6 +270,10 @@ impl SandboxPolicy {
         SandboxPolicy {
             fs: self.fs.merge(other.fs),
             network: self.network.merge(other.network),
+            allowed_unix_sockets: merge_unique(
+                self.allowed_unix_sockets,
+                other.allowed_unix_sockets,
+            ),
         }
     }
 
@@ -340,6 +283,7 @@ impl SandboxPolicy {
         match &mut self.fs {
             SandboxFsPolicy::Unrestricted {
                 protected_paths: existing,
+                ..
             }
             | SandboxFsPolicy::Restricted {
                 protected_paths: existing,
@@ -348,18 +292,43 @@ impl SandboxPolicy {
         }
         self
     }
+
+    /// Replace the protected file names in the filesystem policy, keeping
+    /// every other part of the policy unchanged.
+    pub fn with_protected_file_names(
+        mut self,
+        protected_file_names: Vec<ProtectedFileName>,
+    ) -> Self {
+        match &mut self.fs {
+            SandboxFsPolicy::Unrestricted {
+                protected_file_names: existing,
+                ..
+            }
+            | SandboxFsPolicy::Restricted {
+                protected_file_names: existing,
+                ..
+            } => *existing = protected_file_names,
+        }
+        self
+    }
+}
+
+fn merge_unique<T: PartialEq>(mut items: Vec<T>, other: Vec<T>) -> Vec<T> {
+    for item in other {
+        if !items.contains(&item) {
+            items.push(item);
+        }
+    }
+    items
 }
 
 fn merge_locations(
-    mut locations: Vec<HostFilesystemLocation>,
+    locations: Vec<HostFilesystemLocation>,
     other: Vec<HostFilesystemLocation>,
 ) -> Vec<HostFilesystemLocation> {
-    for location in other {
-        if !locations.contains(&location) {
-            locations.push(location);
-        }
-    }
-    locations
+    // Union the two sets and reduce to a minimal cover, so a location nested
+    // under another (in either input) is dropped rather than bound redundantly.
+    normalize_host_filesystem_locations(locations.into_iter().chain(other))
 }
 
 fn validate_writable_paths_do_not_overlap_protected_paths(
@@ -368,7 +337,7 @@ fn validate_writable_paths_do_not_overlap_protected_paths(
 ) -> Result<(), SandboxError> {
     for writable_path in writable_paths {
         for protected_path in protected_paths {
-            if writable_path_overlaps_protected_path(writable_path, protected_path) {
+            if location_is_within(writable_path, protected_path) {
                 return Err(SandboxError::InvalidRequest(format!(
                     "writable sandbox path `{}` overlaps protected path `{}`",
                     writable_path.untrusted_path_display(),
@@ -380,32 +349,102 @@ fn validate_writable_paths_do_not_overlap_protected_paths(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn writable_path_overlaps_protected_path(
-    writable_path: &HostFilesystemLocation,
-    protected_path: &HostFilesystemLocation,
+/// Rejects a path disallowing reads at or beneath a path allowing reads.
+/// Allowing wins where the two overlap, so such an entry would have no effect
+/// and the path the caller meant to hide would stay readable.
+fn validate_paths_disallowing_reads_have_effect(
+    paths_disallowing_reads: &[HostFilesystemLocation],
+    paths_allowing_reads: &[HostFilesystemLocation],
+) -> Result<(), SandboxError> {
+    for disallowing in paths_disallowing_reads {
+        for allowing in paths_allowing_reads {
+            if location_is_within(disallowing, allowing) {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "sandbox path disallowing reads `{}` lies inside path allowing reads `{}`",
+                    disallowing.untrusted_path_display(),
+                    allowing.untrusted_path_display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unions two layers' paths disallowing reads. A path allowing reads from one
+/// layer is kept only where the other layer leaves its whole subtree readable
+/// too, so merging can never make readable a subtree that either layer
+/// disallows.
+fn merge_read_restrictions(
+    disallowing_a: Vec<HostFilesystemLocation>,
+    allowing_a: Vec<HostFilesystemLocation>,
+    disallowing_b: Vec<HostFilesystemLocation>,
+    allowing_b: Vec<HostFilesystemLocation>,
+) -> (Vec<HostFilesystemLocation>, Vec<HostFilesystemLocation>) {
+    let kept_a: Vec<_> = allowing_a
+        .iter()
+        .filter(|allowing| subtree_is_readable(allowing, &disallowing_b, &allowing_b))
+        .cloned()
+        .collect();
+    let kept_b: Vec<_> = allowing_b
+        .iter()
+        .filter(|allowing| subtree_is_readable(allowing, &disallowing_a, &allowing_a))
+        .cloned()
+        .collect();
+    (
+        merge_locations(disallowing_a, disallowing_b),
+        merge_locations(kept_a, kept_b),
+    )
+}
+
+/// Whether a layer with these paths disallowing and allowing reads leaves the
+/// whole subtree at `location` readable.
+fn subtree_is_readable(
+    location: &HostFilesystemLocation,
+    paths_disallowing_reads: &[HostFilesystemLocation],
+    paths_allowing_reads: &[HostFilesystemLocation],
 ) -> bool {
-    linux_location_is_equal_or_descendant(writable_path, protected_path)
+    paths_disallowing_reads.iter().all(|disallowing| {
+        if location_is_within(disallowing, location) {
+            false
+        } else if location_is_within(location, disallowing) {
+            paths_allowing_reads
+                .iter()
+                .any(|allowing| location_is_within(location, allowing))
+        } else {
+            true
+        }
+    })
+}
+
+/// Whether `location` is the same file or directory as `ancestor`, or lies
+/// beneath it. Compares what each location resolved to when it was captured
+/// rather than looking the paths up again.
+#[cfg(target_os = "linux")]
+pub(crate) fn location_is_within(
+    location: &HostFilesystemLocation,
+    ancestor: &HostFilesystemLocation,
+) -> bool {
+    linux_location_is_equal_or_descendant(location, ancestor)
 }
 
 #[cfg(target_os = "macos")]
-fn writable_path_overlaps_protected_path(
-    writable_path: &HostFilesystemLocation,
-    protected_path: &HostFilesystemLocation,
+pub(crate) fn location_is_within(
+    location: &HostFilesystemLocation,
+    ancestor: &HostFilesystemLocation,
 ) -> bool {
-    writable_path
+    location
         .macos_canonical_path()
-        .starts_with(protected_path.macos_canonical_path())
+        .starts_with(ancestor.macos_canonical_path())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn writable_path_overlaps_protected_path(
-    writable_path: &HostFilesystemLocation,
-    protected_path: &HostFilesystemLocation,
+pub(crate) fn location_is_within(
+    location: &HostFilesystemLocation,
+    ancestor: &HostFilesystemLocation,
 ) -> bool {
-    writable_path
-        .untrusted_path_for_display
-        .starts_with(&protected_path.untrusted_path_for_display)
+    location
+        .untrusted_raw_path()
+        .starts_with(ancestor.untrusted_raw_path())
 }
 
 #[cfg(target_os = "linux")]
@@ -413,7 +452,7 @@ fn linux_location_is_equal_or_descendant(
     location: &HostFilesystemLocation,
     ancestor: &HostFilesystemLocation,
 ) -> bool {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 
     if location == ancestor {
         return true;
@@ -437,15 +476,15 @@ fn linux_location_is_equal_or_descendant(
             OwnedFd::from_raw_fd(fd)
         };
 
-        let Some(parent_identity) = linux_fd_identity(parent.as_raw_fd()) else {
+        let Some(parent_identity) = linux_fd_identity(parent.as_fd()) else {
             log::warn!("failed to fstat parent fd while checking protected path overlap");
             return false;
         };
-        let Some(current_identity) = linux_fd_identity(current.as_raw_fd()) else {
+        let Some(current_identity) = linux_fd_identity(current.as_fd()) else {
             log::warn!("failed to fstat current fd while checking protected path overlap");
             return false;
         };
-        let Some(ancestor_identity) = linux_fd_identity(ancestor.linux_fd().as_raw_fd()) else {
+        let Some(ancestor_identity) = linux_fd_identity(ancestor.linux_fd().as_fd()) else {
             log::warn!("failed to fstat protected fd while checking protected path overlap");
             return false;
         };
@@ -462,58 +501,98 @@ fn linux_location_is_equal_or_descendant(
 
 impl SandboxFsPolicy {
     /// Unrestricted access dominates; otherwise the writable subtrees union.
+    /// Protected paths, protected file names, and paths disallowing reads
+    /// always union. A path allowing reads survives only where the other layer
+    /// leaves its whole subtree readable too, so merging never makes readable
+    /// what either layer disallows.
     pub fn merge(self, other: SandboxFsPolicy) -> SandboxFsPolicy {
         match (self, other) {
             (
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_a,
+                    protected_file_names: names_a,
+                    paths_disallowing_reads: disallowing_a,
+                    paths_allowing_reads: allowing_a,
                 },
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_b,
+                    protected_file_names: names_b,
+                    paths_disallowing_reads: disallowing_b,
+                    paths_allowing_reads: allowing_b,
                 },
-            ) => SandboxFsPolicy::Unrestricted {
-                protected_paths: merge_locations(protected_a, protected_b),
-            },
-            (
+            )
+            | (
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_a,
+                    protected_file_names: names_a,
+                    paths_disallowing_reads: disallowing_a,
+                    paths_allowing_reads: allowing_a,
                 },
                 SandboxFsPolicy::Restricted {
                     protected_paths: protected_b,
+                    protected_file_names: names_b,
+                    paths_disallowing_reads: disallowing_b,
+                    paths_allowing_reads: allowing_b,
                     ..
                 },
             )
             | (
                 SandboxFsPolicy::Restricted {
                     protected_paths: protected_a,
+                    protected_file_names: names_a,
+                    paths_disallowing_reads: disallowing_a,
+                    paths_allowing_reads: allowing_a,
                     ..
                 },
                 SandboxFsPolicy::Unrestricted {
                     protected_paths: protected_b,
+                    protected_file_names: names_b,
+                    paths_disallowing_reads: disallowing_b,
+                    paths_allowing_reads: allowing_b,
                 },
-            ) => SandboxFsPolicy::Unrestricted {
-                protected_paths: merge_locations(protected_a, protected_b),
-            },
+            ) => {
+                let (paths_disallowing_reads, paths_allowing_reads) =
+                    merge_read_restrictions(disallowing_a, allowing_a, disallowing_b, allowing_b);
+                SandboxFsPolicy::Unrestricted {
+                    protected_paths: merge_locations(protected_a, protected_b),
+                    protected_file_names: merge_unique(names_a, names_b),
+                    paths_disallowing_reads,
+                    paths_allowing_reads,
+                }
+            }
             (
                 SandboxFsPolicy::Restricted {
                     writable_paths: writable_a,
                     protected_paths: protected_a,
+                    protected_file_names: names_a,
+                    paths_disallowing_reads: disallowing_a,
+                    paths_allowing_reads: allowing_a,
                 },
                 SandboxFsPolicy::Restricted {
                     writable_paths: writable_b,
                     protected_paths: protected_b,
+                    protected_file_names: names_b,
+                    paths_disallowing_reads: disallowing_b,
+                    paths_allowing_reads: allowing_b,
                 },
-            ) => SandboxFsPolicy::Restricted {
-                writable_paths: merge_locations(writable_a, writable_b),
-                protected_paths: merge_locations(protected_a, protected_b),
-            },
+            ) => {
+                let (paths_disallowing_reads, paths_allowing_reads) =
+                    merge_read_restrictions(disallowing_a, allowing_a, disallowing_b, allowing_b);
+                SandboxFsPolicy::Restricted {
+                    writable_paths: merge_locations(writable_a, writable_b),
+                    protected_paths: merge_locations(protected_a, protected_b),
+                    protected_file_names: merge_unique(names_a, names_b),
+                    paths_disallowing_reads,
+                    paths_allowing_reads,
+                }
+            }
         }
     }
 }
 
 impl SandboxNetPolicy {
     /// Unrestricted access dominates and `Blocked` is the identity; otherwise the
-    /// allowed domains union.
+    /// allowed domains and TCP ports each union.
     pub fn merge(self, other: SandboxNetPolicy) -> SandboxNetPolicy {
         match (self, other) {
             (SandboxNetPolicy::Unrestricted, _) | (_, SandboxNetPolicy::Unrestricted) => {
@@ -522,17 +601,17 @@ impl SandboxNetPolicy {
             (SandboxNetPolicy::Blocked, other) | (other, SandboxNetPolicy::Blocked) => other,
             (
                 SandboxNetPolicy::Restricted {
-                    allowed_domains: mut a,
+                    allowed_domains: domains_a,
+                    allowed_tcp_ports: ports_a,
                 },
-                SandboxNetPolicy::Restricted { allowed_domains: b },
-            ) => {
-                for domain in b {
-                    if !a.contains(&domain) {
-                        a.push(domain);
-                    }
-                }
-                SandboxNetPolicy::Restricted { allowed_domains: a }
-            }
+                SandboxNetPolicy::Restricted {
+                    allowed_domains: domains_b,
+                    allowed_tcp_ports: ports_b,
+                },
+            ) => SandboxNetPolicy::Restricted {
+                allowed_domains: merge_unique(domains_a, domains_b),
+                allowed_tcp_ports: merge_unique(ports_a, ports_b),
+            },
         }
     }
 }
@@ -626,6 +705,14 @@ struct FsSetup {
     allow_fs_write: bool,
     writable_paths: Vec<HostFilesystemLocation>,
     protected_paths: Vec<HostFilesystemLocation>,
+    /// Only the Seatbelt backend can enforce these; other platforms reject a
+    /// non-empty list in [`Sandbox::new`].
+    #[cfg(target_os = "macos")]
+    protected_file_names: Vec<ProtectedFileName>,
+    #[cfg(target_os = "macos")]
+    paths_disallowing_reads: Vec<HostFilesystemLocation>,
+    #[cfg(target_os = "macos")]
+    paths_allowing_reads: Vec<HostFilesystemLocation>,
 }
 
 /// Resolved network plan derived from [`SandboxNetPolicy`]. For the restricted
@@ -640,6 +727,10 @@ enum NetSetup {
     #[cfg(not(target_os = "windows"))]
     Restricted {
         allowlist: Allowlist,
+        /// Only the Seatbelt backend can enforce these; other platforms reject
+        /// a non-empty list in [`Sandbox::new`].
+        #[cfg(target_os = "macos")]
+        allowed_tcp_ports: Vec<u16>,
     },
 }
 
@@ -652,9 +743,14 @@ enum NetSetup {
 pub struct Sandbox {
     fs: FsSetup,
     network: NetSetup,
+    #[cfg(target_os = "macos")]
+    allowed_unix_sockets: Vec<HostFilesystemLocation>,
     /// In-process network proxy for the restricted-network case, spawned on the
     /// first `wrap`. Dropped on a background thread (the join blocks).
     proxy: Option<ProxyHandle>,
+    /// Where proxy events are forwarded, in addition to being logged.
+    #[cfg(not(target_os = "windows"))]
+    network_events: Option<UnboundedSender<ProxyEvent>>,
     /// Linux only: the host endpoint that hands the in-sandbox validator the
     /// captured `O_PATH` fds over a unix socket. Runs entirely in-process (a
     /// short-lived background thread, never a separate process) and is owned by
@@ -683,41 +779,131 @@ impl Sandbox {
     /// created lazily on the first [`Sandbox::wrap`] (so it can chain through an
     /// upstream proxy named in the command's environment), and `bwrap`
     /// availability is checked separately via [`Sandbox::can_create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::UnsupportedPolicy`] on Linux and Windows when the
+    /// policy has any [`ProtectedFileName`]s, paths disallowing or allowing
+    /// reads, Unix socket grants,
+    /// or TCP port grants, because those backends cannot enforce them yet.
+    /// Returns [`SandboxError::InvalidRequest`] for a malformed policy, such as
+    /// a writable path inside a protected path, a path disallowing reads that
+    /// is also, or lies inside, a path allowing reads, or TCP port 0.
     pub fn new(policy: SandboxPolicy) -> Result<Self, SandboxError> {
-        let fs = match policy.fs {
-            SandboxFsPolicy::Unrestricted { protected_paths } => FsSetup {
-                allow_fs_write: true,
-                writable_paths: Vec::new(),
+        let (
+            allow_fs_write,
+            writable_paths,
+            protected_paths,
+            protected_file_names,
+            paths_disallowing_reads,
+            paths_allowing_reads,
+        ) = match policy.fs {
+            SandboxFsPolicy::Unrestricted {
                 protected_paths,
-            },
+                protected_file_names,
+                paths_disallowing_reads,
+                paths_allowing_reads,
+            } => (
+                true,
+                Vec::new(),
+                protected_paths,
+                protected_file_names,
+                paths_disallowing_reads,
+                paths_allowing_reads,
+            ),
             SandboxFsPolicy::Restricted {
                 writable_paths,
                 protected_paths,
+                protected_file_names,
+                paths_disallowing_reads,
+                paths_allowing_reads,
             } => {
                 validate_writable_paths_do_not_overlap_protected_paths(
                     &writable_paths,
                     &protected_paths,
                 )?;
-                FsSetup {
-                    allow_fs_write: false,
+                (
+                    false,
                     writable_paths,
                     protected_paths,
-                }
+                    protected_file_names,
+                    paths_disallowing_reads,
+                    paths_allowing_reads,
+                )
             }
+        };
+        validate_paths_disallowing_reads_have_effect(
+            &paths_disallowing_reads,
+            &paths_allowing_reads,
+        )?;
+
+        // Bubblewrap can only protect inodes that exist when the sandbox is
+        // built, so it cannot deny a name in a directory created later. Fail
+        // closed until the planned Linux syscall-interception backend lands.
+        #[cfg(not(target_os = "macos"))]
+        if !protected_file_names.is_empty() {
+            return Err(SandboxError::UnsupportedPolicy(
+                "protected file names are not yet supported by this platform's sandbox".to_string(),
+            ));
+        }
+        // Bubblewrap can only hide paths by mounting over them, which neither
+        // covers paths created later nor allows reads of paths underneath.
+        #[cfg(not(target_os = "macos"))]
+        if !paths_disallowing_reads.is_empty() || !paths_allowing_reads.is_empty() {
+            return Err(SandboxError::UnsupportedPolicy(
+                "paths disallowing reads are not yet supported by this platform's sandbox"
+                    .to_string(),
+            ));
+        }
+        // Bubblewrap's seccomp filter denies every `AF_UNIX` socket, and its
+        // network namespace only reaches the proxy, so neither grant can be
+        // honoured there.
+        #[cfg(not(target_os = "macos"))]
+        if !policy.allowed_unix_sockets.is_empty() {
+            return Err(SandboxError::UnsupportedPolicy(
+                "Unix socket grants are not yet supported by this platform's sandbox".to_string(),
+            ));
+        }
+        #[cfg(not(target_os = "macos"))]
+        if let SandboxNetPolicy::Restricted {
+            allowed_tcp_ports, ..
+        } = &policy.network
+            && !allowed_tcp_ports.is_empty()
+        {
+            return Err(SandboxError::UnsupportedPolicy(
+                "TCP port grants are not yet supported by this platform's sandbox".to_string(),
+            ));
+        }
+
+        let fs = FsSetup {
+            allow_fs_write,
+            writable_paths,
+            protected_paths,
+            #[cfg(target_os = "macos")]
+            protected_file_names,
+            #[cfg(target_os = "macos")]
+            paths_disallowing_reads,
+            #[cfg(target_os = "macos")]
+            paths_allowing_reads,
         };
 
         let network = match policy.network {
             SandboxNetPolicy::Unrestricted => NetSetup::Unrestricted,
             SandboxNetPolicy::Blocked => NetSetup::Blocked,
-            SandboxNetPolicy::Restricted { allowed_domains } => {
-                resolve_restricted_network(&allowed_domains)?
-            }
+            SandboxNetPolicy::Restricted {
+                allowed_domains,
+                allowed_tcp_ports,
+            } => resolve_restricted_network(&allowed_domains, &allowed_tcp_ports)?,
         };
 
         Ok(Self {
             fs,
             network,
+            #[cfg(target_os = "macos")]
+            allowed_unix_sockets: policy.allowed_unix_sockets,
             proxy: None,
+            #[cfg(not(target_os = "windows"))]
+            network_events: None,
             #[cfg(target_os = "linux")]
             validation_fd_sender: None,
             #[cfg(target_os = "windows")]
@@ -725,6 +911,33 @@ impl Sandbox {
             #[cfg(target_os = "macos")]
             seatbelt_config: None,
         })
+    }
+
+    /// Like [`Sandbox::new`], but also forward every event of the network
+    /// proxy to `network_events`: its `Ready` port, then each request it allows
+    /// or denies (with the host and [`DenyReason`]), and each allowed request's
+    /// completion. Events are still logged as with [`Sandbox::new`].
+    ///
+    /// Only a [`SandboxNetPolicy::Restricted`] policy runs a proxy; for any other
+    /// network policy no events are sent.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Sandbox::new`].
+    pub fn with_network_events(
+        policy: SandboxPolicy,
+        network_events: UnboundedSender<ProxyEvent>,
+    ) -> Result<Self, SandboxError> {
+        #[cfg_attr(target_os = "windows", allow(unused_mut))]
+        let mut sandbox = Self::new(policy)?;
+        // Windows rejects restricted networking, so it never runs a proxy.
+        #[cfg(target_os = "windows")]
+        drop(network_events);
+        #[cfg(not(target_os = "windows"))]
+        {
+            sandbox.network_events = Some(network_events);
+        }
+        Ok(sandbox)
     }
 
     /// Windows only: record the `(release channel, version)` of the Linux `zed`
@@ -838,7 +1051,7 @@ impl Sandbox {
         &mut self,
         env: &mut HashMap<String, String>,
     ) -> Result<Option<(u16, Option<PathBuf>)>, SandboxError> {
-        let NetSetup::Restricted { allowlist } = &self.network else {
+        let NetSetup::Restricted { allowlist, .. } = &self.network else {
             return Ok(None);
         };
 
@@ -857,7 +1070,7 @@ impl Sandbox {
             let handle = handle.map_err(|error| {
                 SandboxError::Io(format!("failed to start network proxy: {error:#}"))
             })?;
-            spawn_proxy_event_logger(events_rx);
+            spawn_proxy_event_logger(events_rx, self.network_events.clone());
             self.proxy = Some(handle);
         }
 
@@ -897,17 +1110,17 @@ impl Sandbox {
         };
         let protected_paths = self.protected_paths();
         // Build the writable binds as (captured fd, bind path) pairs in lockstep.
-        // The bind *path* is derived from the pinned inode (readlink of the
-        // captured `O_PATH` fd), never from an attacker-influenceable string; the
-        // *fd* is what the in-sandbox validator compares the mounted inode
-        // against. The two lists stay in the same order so each fd lines up with
-        // its path on the validator side.
+        // The bind *path* is the verified canonical path of each location — for a
+        // persisted grant, `HostFilesystemLocation::reopen` already proved this
+        // path's current inode is the approved one (`readlink(fd) == canonical`)
+        // and holds the fd open pinning it. The *fd* is what the in-sandbox
+        // validator compares the mounted inode against, catching any swap between
+        // that host-side check and the mount. The two lists stay in the same
+        // order so each fd lines up with its path on the validator side.
         let mut writable_owned: Vec<PathBuf> = Vec::new();
         let mut writable_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
         for location in &self.fs.writable_paths {
-            let Some(path) = linux_location_path(location) else {
-                continue;
-            };
+            let path = location.linux_canonical_path().to_path_buf();
             match location.linux_dup_fd() {
                 Ok(fd) => {
                     writable_owned.push(path);
@@ -926,7 +1139,7 @@ impl Sandbox {
         let writable: Vec<&Path> = writable_owned.iter().map(PathBuf::as_path).collect();
         let protected_owned: Vec<PathBuf> = protected_paths
             .iter()
-            .filter_map(linux_location_path)
+            .map(|location| location.linux_canonical_path().to_path_buf())
             .collect();
         let protected_paths: Vec<&Path> = protected_owned.iter().map(PathBuf::as_path).collect();
 
@@ -987,11 +1200,16 @@ impl Sandbox {
         let mut env = command.env.clone();
         let proxy = self.ensure_restricted_proxy(&mut env)?;
 
-        let network = match &self.network {
-            NetSetup::Unrestricted => macos_seatbelt::NetworkAccess::All,
-            NetSetup::Blocked => macos_seatbelt::NetworkAccess::None,
-            NetSetup::Restricted { .. } => macos_seatbelt::NetworkAccess::LocalhostPort(
-                proxy.as_ref().map(|(port, _)| *port).unwrap_or(0),
+        let (network, allowed_tcp_ports): (_, &[u16]) = match &self.network {
+            NetSetup::Unrestricted => (macos_seatbelt::NetworkAccess::All, &[]),
+            NetSetup::Blocked => (macos_seatbelt::NetworkAccess::None, &[]),
+            NetSetup::Restricted {
+                allowed_tcp_ports, ..
+            } => (
+                macos_seatbelt::NetworkAccess::LocalhostPort(
+                    proxy.as_ref().map(|(port, _)| *port).unwrap_or(0),
+                ),
+                allowed_tcp_ports,
             ),
         };
 
@@ -1014,15 +1232,34 @@ impl Sandbox {
             .iter()
             .map(HostFilesystemLocation::macos_canonical_path)
             .collect();
+        let paths_disallowing_reads: Vec<&Path> = self
+            .fs
+            .paths_disallowing_reads
+            .iter()
+            .map(HostFilesystemLocation::macos_canonical_path)
+            .collect();
+        let paths_allowing_reads: Vec<&Path> = self
+            .fs
+            .paths_allowing_reads
+            .iter()
+            .map(HostFilesystemLocation::macos_canonical_path)
+            .collect();
+        let allowed_unix_sockets: Vec<&Path> = self
+            .allowed_unix_sockets
+            .iter()
+            .map(HostFilesystemLocation::macos_canonical_path)
+            .collect();
 
-        // SSH-agent socket handling (commit signing) is deferred, so no unix
-        // sockets are allowed for now.
         let (program, args, config) = macos_seatbelt::wrap_invocation(
             &command.program,
             &command.args,
             &writable,
             &protected,
-            &[],
+            &self.fs.protected_file_names,
+            &paths_disallowing_reads,
+            &paths_allowing_reads,
+            &allowed_unix_sockets,
+            allowed_tcp_ports,
             permissions,
         )
         .map_err(map_anyhow_error)?;
@@ -1047,19 +1284,19 @@ impl Sandbox {
             allow_network: matches!(self.network, NetSetup::Unrestricted),
             allow_fs_write: self.fs.allow_fs_write,
         };
-        // On Windows the location carries only the requested path; the in-WSL
-        // helper performs the real capture-at-validation. These are mapped into
-        // WSL by `wrap_invocation`.
-        let writable_paths: Vec<PathBuf> = self
+        let writable_paths = self
             .fs
             .writable_paths
             .iter()
-            .map(|location| location.windows_path().to_path_buf())
+            .map(|location| windows_wsl::WritablePath {
+                requested: location.windows_requested_path().to_path_buf(),
+                canonical: location.windows_canonical_path().to_path_buf(),
+            })
             .collect();
         let protected_paths: Vec<PathBuf> = self
             .protected_paths()
             .iter()
-            .map(|location| location.windows_path().to_path_buf())
+            .map(|location| location.windows_requested_path().to_path_buf())
             .collect();
         let (program, args) = windows_wsl::wrap_invocation(
             command.program.clone(),
@@ -1104,6 +1341,8 @@ impl Drop for Sandbox {
 /// otherwise it's dead code on macOS.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const WSL_SANDBOX_HELPER_FLAG: &str = "--wsl-sandbox-helper";
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const WSL_SANDBOX_RESOLVE_FLAG: &str = "--wsl-sandbox-resolve-path";
 
 /// Handle a possible re-exec of this binary as a sandbox helper.
 ///
@@ -1129,18 +1368,11 @@ pub fn run_sandbox_launcher_if_invoked() {
 // with no writable binds rather than re-deriving paths from the opaque
 // locations.
 
-/// The current path of the inode pinned by a [`HostFilesystemLocation`]'s
-/// `O_PATH` fd, via `/proc/self/fd`. This resolves to the *pinned inode*, so it
-/// reflects the object captured at validation even if its name was changed,
-/// rather than re-resolving an attacker-influenceable path string.
-#[cfg(target_os = "linux")]
-fn linux_location_path(location: &HostFilesystemLocation) -> Option<PathBuf> {
-    use std::os::fd::AsRawFd as _;
-    std::fs::read_link(format!("/proc/self/fd/{}", location.linux_fd().as_raw_fd())).ok()
-}
-
 #[cfg(not(target_os = "windows"))]
-fn resolve_restricted_network(allowed_domains: &[String]) -> Result<NetSetup, SandboxError> {
+fn resolve_restricted_network(
+    allowed_domains: &[String],
+    allowed_tcp_ports: &[u16],
+) -> Result<NetSetup, SandboxError> {
     let mut patterns = Vec::with_capacity(allowed_domains.len());
     for domain in allowed_domains {
         let pattern = HostPattern::parse(domain).map_err(|error| {
@@ -1148,13 +1380,23 @@ fn resolve_restricted_network(allowed_domains: &[String]) -> Result<NetSetup, Sa
         })?;
         patterns.push(pattern);
     }
+    if allowed_tcp_ports.contains(&0) {
+        return Err(SandboxError::InvalidRequest(
+            "TCP port 0 is not a valid destination port".to_string(),
+        ));
+    }
     Ok(NetSetup::Restricted {
         allowlist: Allowlist::from_patterns(patterns),
+        #[cfg(target_os = "macos")]
+        allowed_tcp_ports: allowed_tcp_ports.to_vec(),
     })
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_restricted_network(_allowed_domains: &[String]) -> Result<NetSetup, SandboxError> {
+fn resolve_restricted_network(
+    _allowed_domains: &[String],
+    _allowed_tcp_ports: &[u16],
+) -> Result<NetSetup, SandboxError> {
     Err(unsupported_restricted_network_on_windows())
 }
 
@@ -1240,17 +1482,25 @@ fn apply_proxy_env(env: &mut HashMap<String, String>, port: u16) {
     }
 }
 
-/// Drain the proxy's event channel on a background thread, logging each event.
-/// v1 surfacing only; future integrations (UI, telemetry) can replace this.
-/// The thread exits when the proxy is dropped and the channel closes.
+/// Drain the proxy's event channel on a background thread, logging each event
+/// and forwarding it to `forward_to` until that receiver is dropped. The thread
+/// exits when the proxy is dropped and the channel closes.
 #[cfg(not(target_os = "windows"))]
-fn spawn_proxy_event_logger(events: futures::channel::mpsc::UnboundedReceiver<ProxyEvent>) {
+fn spawn_proxy_event_logger(
+    events: futures::channel::mpsc::UnboundedReceiver<ProxyEvent>,
+    mut forward_to: Option<UnboundedSender<ProxyEvent>>,
+) {
     std::thread::spawn(move || {
         futures::executor::block_on(async move {
             use futures::StreamExt as _;
             let mut events = events;
             while let Some(event) = events.next().await {
                 log_proxy_event(&event);
+                if let Some(sender) = &forward_to
+                    && sender.unbounded_send(event).is_err()
+                {
+                    forward_to = None;
+                }
             }
         });
     });
@@ -1309,6 +1559,7 @@ fn map_anyhow_error(error: anyhow::Error) -> SandboxError {
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
 
     #[test]
     fn restricted_fs_rejects_writable_paths_inside_protected_paths() {
@@ -1318,17 +1569,22 @@ mod tests {
         let hooks_dir = git_dir.join("hooks");
         std::fs::create_dir_all(&hooks_dir).expect("create git hooks dir");
 
-        let protected_git = HostFilesystemLocation::new(&git_dir).expect("capture git dir");
-        let writable_git = HostFilesystemLocation::new(&git_dir).expect("capture git dir");
-        let writable_hooks = HostFilesystemLocation::new(&hooks_dir).expect("capture hooks dir");
+        let protected_git = HostFilesystemLocation::capture(&git_dir).expect("capture git dir");
+        let writable_git = HostFilesystemLocation::capture(&git_dir).expect("capture git dir");
+        let writable_hooks =
+            HostFilesystemLocation::capture(&hooks_dir).expect("capture hooks dir");
 
         for writable_path in [writable_git, writable_hooks] {
             let result = Sandbox::new(SandboxPolicy {
                 fs: SandboxFsPolicy::Restricted {
                     writable_paths: vec![writable_path],
                     protected_paths: vec![protected_git.clone()],
+                    protected_file_names: Vec::new(),
+                    paths_disallowing_reads: Vec::new(),
+                    paths_allowing_reads: Vec::new(),
                 },
                 network: SandboxNetPolicy::Blocked,
+                allowed_unix_sockets: Vec::new(),
             });
 
             assert!(matches!(result, Err(SandboxError::InvalidRequest(_))));
@@ -1349,18 +1605,22 @@ mod tests {
         std::fs::create_dir_all(&git_dir).expect("create git dir");
         std::fs::create_dir_all(&outside_hooks_dir).expect("create outside hooks dir");
 
-        let protected_git = HostFilesystemLocation::new(&git_dir).expect("capture git dir");
+        let protected_git = HostFilesystemLocation::capture(&git_dir).expect("capture git dir");
         std::fs::rename(&git_dir, &real_git_dir).expect("move git dir aside");
         unix_fs::symlink(&outside_dir, &git_dir).expect("replace git dir with symlink");
         let writable_displayed_inside_git =
-            HostFilesystemLocation::new(git_dir.join("hooks")).expect("capture symlink target");
+            HostFilesystemLocation::capture(git_dir.join("hooks")).expect("capture symlink target");
 
         Sandbox::new(SandboxPolicy {
             fs: SandboxFsPolicy::Restricted {
                 writable_paths: vec![writable_displayed_inside_git],
                 protected_paths: vec![protected_git],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             },
             network: SandboxNetPolicy::Blocked,
+            allowed_unix_sockets: Vec::new(),
         })
         .expect("captured writable fd is outside protected metadata");
     }
@@ -1374,55 +1634,101 @@ mod tests {
         let dir_c = tempfile::tempdir().expect("create temp dir c");
         let dir_d = tempfile::tempdir().expect("create temp dir d");
         let location = |dir: &tempfile::TempDir| {
-            HostFilesystemLocation::new(dir.path()).expect("capture temp dir")
+            HostFilesystemLocation::capture(dir.path()).expect("capture temp dir")
         };
 
         let a = SandboxFsPolicy::Restricted {
             writable_paths: vec![location(&dir_a), location(&dir_b)],
             protected_paths: vec![location(&dir_c)],
+            protected_file_names: Vec::new(),
+            paths_disallowing_reads: Vec::new(),
+            paths_allowing_reads: Vec::new(),
         };
         let b = SandboxFsPolicy::Restricted {
             writable_paths: vec![location(&dir_b), location(&dir_c)],
             protected_paths: vec![location(&dir_c), location(&dir_d)],
+            protected_file_names: Vec::new(),
+            paths_disallowing_reads: Vec::new(),
+            paths_allowing_reads: Vec::new(),
         };
         assert_eq!(
             a.clone().merge(b),
             SandboxFsPolicy::Restricted {
                 writable_paths: vec![location(&dir_a), location(&dir_b), location(&dir_c)],
                 protected_paths: vec![location(&dir_c), location(&dir_d)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }
         );
         assert_eq!(
             a.merge(SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_a)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }),
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_c), location(&dir_a)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }
         );
         assert_eq!(
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_d)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }
             .merge(SandboxFsPolicy::Restricted {
                 writable_paths: vec![location(&dir_a)],
                 protected_paths: vec![location(&dir_c)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }),
             SandboxFsPolicy::Unrestricted {
                 protected_paths: vec![location(&dir_d), location(&dir_c)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: Vec::new(),
+                paths_allowing_reads: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn protected_file_name_rejects_anything_but_one_path_component() {
+        for name in ["", ".", "..", "a/b", "/", ".envrc/", "a\0b"] {
+            assert!(
+                matches!(
+                    ProtectedFileName::new(name),
+                    Err(SandboxError::InvalidRequest(_))
+                ),
+                "{name:?} should be rejected"
+            );
+        }
+        for name in [".envrc", "...", "a.b+c", "with space"] {
+            assert_eq!(ProtectedFileName::new(name).unwrap().as_str(), name);
+        }
     }
 
     #[test]
     fn net_merge_unrestricted_dominates_blocked_is_identity_else_unions() {
         let hosts = |list: &[&str]| SandboxNetPolicy::Restricted {
             allowed_domains: list.iter().map(|s| s.to_string()).collect(),
+            allowed_tcp_ports: Vec::new(),
         };
         assert_eq!(
             hosts(&["a.com", "b.com"]).merge(hosts(&["b.com", "c.com"])),
             hosts(&["a.com", "b.com", "c.com"])
         );
+        let ports = |list: &[u16]| SandboxNetPolicy::Restricted {
+            allowed_domains: Vec::new(),
+            allowed_tcp_ports: list.to_vec(),
+        };
+        assert_eq!(ports(&[22]).merge(ports(&[5432, 22])), ports(&[22, 5432]));
         assert_eq!(
             SandboxNetPolicy::Blocked.merge(hosts(&["a.com"])),
             hosts(&["a.com"])
@@ -1485,6 +1791,487 @@ mod tests {
         }
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
     }
+
+    #[test]
+    fn restricted_network_rejects_tcp_port_zero() {
+        let result = Sandbox::new(SandboxPolicy {
+            fs: unrestricted_fs(),
+            network: SandboxNetPolicy::Restricted {
+                allowed_domains: Vec::new(),
+                allowed_tcp_ports: vec![0],
+            },
+            allowed_unix_sockets: Vec::new(),
+        });
+        assert!(matches!(
+            result,
+            Err(SandboxError::InvalidRequest(_) | SandboxError::UnsupportedPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn network_events_report_denied_hosts() {
+        let policy = SandboxPolicy {
+            fs: unrestricted_fs(),
+            network: SandboxNetPolicy::Restricted {
+                allowed_domains: vec!["allowed.example".to_string()],
+                allowed_tcp_ports: Vec::new(),
+            },
+            allowed_unix_sockets: Vec::new(),
+        };
+        if !host_can_run_sandbox(&policy) {
+            return;
+        }
+        let (events_sender, events) = futures::channel::mpsc::unbounded();
+        let mut sandbox =
+            Sandbox::with_network_events(policy, events_sender).expect("create sandbox");
+
+        // The proxy denies the host before resolving it, so this needs no
+        // network access.
+        run_sandboxed(
+            &mut sandbox,
+            "/usr/bin/curl",
+            &["--silent", "--max-time", "10", "https://denied.example/"],
+        );
+        sandbox.drop_on_current_thread();
+
+        let events: Vec<ProxyEvent> = futures::executor::block_on(events.collect());
+        assert!(matches!(events.first(), Some(ProxyEvent::Ready { .. })));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ProxyEvent::RequestAttempt {
+                    host,
+                    outcome: RequestOutcome::Denied {
+                        reason: DenyReason::HostNotInAllowlist { .. }
+                    },
+                    ..
+                } if host == "denied.example"
+            )),
+            "expected a denied attempt for denied.example, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn restricted_network_allows_only_the_proxy_and_granted_tcp_ports() {
+        // The kernel completes `nc -z`'s connect from the listen backlog, so the
+        // listeners never need to accept.
+        let granted_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind granted listener");
+        let other_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind other listener");
+        let granted_port = granted_listener
+            .local_addr()
+            .expect("granted listener address")
+            .port();
+        let other_port = other_listener
+            .local_addr()
+            .expect("other listener address")
+            .port();
+
+        let (events_sender, mut events) = futures::channel::mpsc::unbounded();
+        let Some(mut sandbox) = enforced_or_refused(Sandbox::with_network_events(
+            SandboxPolicy {
+                fs: unrestricted_fs(),
+                network: SandboxNetPolicy::Restricted {
+                    allowed_domains: vec!["example.com".to_string()],
+                    allowed_tcp_ports: vec![granted_port],
+                },
+                allowed_unix_sockets: Vec::new(),
+            },
+            events_sender,
+        )) else {
+            return;
+        };
+
+        let tcp_connects = |sandbox: &mut Sandbox, port: u16| {
+            run_sandboxed(
+                sandbox,
+                "/usr/bin/nc",
+                &["-z", "-w", "5", "127.0.0.1", &port.to_string()],
+            )
+            .status
+            .success()
+        };
+        assert!(tcp_connects(&mut sandbox, granted_port), "granted port");
+        let proxy_port = match futures::executor::block_on(events.next()) {
+            Some(ProxyEvent::Ready { port }) => port,
+            other => panic!("expected the proxy's Ready event, got {other:?}"),
+        };
+        assert!(tcp_connects(&mut sandbox, proxy_port), "proxy port");
+        assert!(
+            !tcp_connects(&mut sandbox, other_port),
+            "reached a TCP port that was not granted"
+        );
+
+        sandbox.drop_on_current_thread();
+    }
+
+    #[test]
+    fn only_granted_unix_sockets_are_reachable() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        // Bind under `/tmp` rather than the default temp dir: macOS temp paths
+        // (`/var/folders/...`) overflow the `sun_path` limit for Unix sockets.
+        // `/tmp` is a symlink, so this also checks that the grant names the
+        // resolved path Seatbelt matches against.
+        let socket_dir = tempfile::Builder::new()
+            .prefix("zed-sock-")
+            .tempdir_in("/tmp")
+            .expect("create socket dir");
+        let granted_socket = socket_dir.path().join("granted.sock");
+        let other_socket = socket_dir.path().join("other.sock");
+        let granted_listener = UnixListener::bind(&granted_socket).expect("bind granted socket");
+        let other_listener = UnixListener::bind(&other_socket).expect("bind other socket");
+        granted_listener
+            .set_nonblocking(true)
+            .expect("make granted listener non-blocking");
+        other_listener
+            .set_nonblocking(true)
+            .expect("make other listener non-blocking");
+
+        for network in [
+            SandboxNetPolicy::Blocked,
+            SandboxNetPolicy::Restricted {
+                allowed_domains: Vec::new(),
+                allowed_tcp_ports: Vec::new(),
+            },
+        ] {
+            let Some(mut sandbox) = enforced_or_refused(Sandbox::new(SandboxPolicy {
+                fs: unrestricted_fs(),
+                network: network.clone(),
+                allowed_unix_sockets: vec![
+                    HostFilesystemLocation::capture(&granted_socket).expect("capture socket"),
+                ],
+            })) else {
+                continue;
+            };
+
+            let output = run_sandboxed(
+                &mut sandbox,
+                "/usr/bin/nc",
+                &["-U", "-w", "1", &granted_socket.display().to_string()],
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let accepted = loop {
+                match granted_listener.accept() {
+                    Ok(_) => break true,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break false,
+                }
+            };
+            assert!(
+                accepted,
+                "granted socket was not reached with {network:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let output = run_sandboxed(
+                &mut sandbox,
+                "/usr/bin/nc",
+                &["-U", "-w", "1", &other_socket.display().to_string()],
+            );
+            assert!(
+                !output.status.success(),
+                "connected to an ungranted socket with {network:?}"
+            );
+            assert!(matches!(
+                other_listener.accept(),
+                Err(error) if error.kind() == ErrorKind::WouldBlock
+            ));
+
+            sandbox.drop_on_current_thread();
+        }
+    }
+
+    #[test]
+    fn policy_merge_unions_unix_sockets() {
+        let socket_dir = tempfile::tempdir().expect("create socket dir");
+        let socket = |name: &str| {
+            let path = socket_dir.path().join(name);
+            // Linux can only capture a path that exists.
+            std::fs::write(&path, "").expect("create socket placeholder");
+            HostFilesystemLocation::capture(path).expect("capture socket path")
+        };
+        let policy = |sockets: Vec<HostFilesystemLocation>| SandboxPolicy {
+            fs: unrestricted_fs(),
+            network: SandboxNetPolicy::Blocked,
+            allowed_unix_sockets: sockets,
+        };
+        assert_eq!(
+            policy(vec![socket("a.sock")]).merge(policy(vec![socket("b.sock"), socket("a.sock")])),
+            policy(vec![socket("a.sock"), socket("b.sock")])
+        );
+    }
+
+    #[test]
+    fn restricted_fs_hides_paths_disallowing_reads_except_their_exceptions() {
+        let project_dir = tempfile::tempdir().expect("create project dir");
+        let readme_file = project_dir.path().join("README");
+        std::fs::write(&readme_file, "public\n").expect("write readme");
+        let secrets_dir = project_dir.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).expect("create secrets dir");
+        let secret_file = secrets_dir.join("id_ed25519");
+        std::fs::write(&secret_file, "private\n").expect("write secret");
+        let kept_dir = secrets_dir.join("kept");
+        std::fs::create_dir(&kept_dir).expect("create kept dir");
+        let kept_file = kept_dir.join("notes");
+        std::fs::write(&kept_file, "kept\n").expect("write kept file");
+        let locked_file = kept_dir.join("locked");
+        std::fs::write(&locked_file, "locked\n").expect("write locked file");
+
+        let Some(mut sandbox) = enforced_or_refused(Sandbox::new(SandboxPolicy {
+            fs: SandboxFsPolicy::Restricted {
+                writable_paths: vec![location(project_dir.path())],
+                protected_paths: vec![location(&locked_file)],
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: vec![location(&secrets_dir)],
+                paths_allowing_reads: vec![location(&kept_dir)],
+            },
+            network: SandboxNetPolicy::Blocked,
+            allowed_unix_sockets: Vec::new(),
+        })) else {
+            return;
+        };
+
+        let output = run_shell(&mut sandbox, &format!("cat '{}'", readme_file.display()));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "public\n");
+        let output = run_shell(&mut sandbox, &format!("cat '{}'", secret_file.display()));
+        assert!(!output.status.success(), "read inside a hidden path");
+        assert!(output.stdout.is_empty(), "hidden bytes leaked");
+        let output = run_shell(&mut sandbox, &format!("ls '{}'", secrets_dir.display()));
+        assert!(!output.status.success(), "listed a hidden path");
+        let hidden_written = secrets_dir.join("written");
+        let output = run_shell(
+            &mut sandbox,
+            &format!("echo hello > '{}'", hidden_written.display()),
+        );
+        assert!(!output.status.success(), "wrote inside a hidden path");
+        assert!(!hidden_written.exists());
+
+        let output = run_shell(&mut sandbox, &format!("cat '{}'", kept_file.display()));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "kept\n");
+        let kept_written = kept_dir.join("written");
+        let output = run_shell(
+            &mut sandbox,
+            &format!("echo hello > '{}'", kept_written.display()),
+        );
+        assert!(
+            output.status.success(),
+            "write inside an exception: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run_shell(
+            &mut sandbox,
+            &format!("echo changed > '{}'", locked_file.display()),
+        );
+        assert!(
+            !output.status.success(),
+            "protected path inside an exception"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&locked_file).expect("read locked file"),
+            "locked\n"
+        );
+    }
+
+    #[test]
+    fn unrestricted_fs_hides_not_yet_created_paths_disallowing_reads() {
+        let root_dir = tempfile::tempdir().expect("create root dir");
+        // Two missing levels under a temp dir reached through the `/var`
+        // symlink, so the rule only matches if the location was resolved
+        // through its nearest existing ancestor.
+        let hidden_dir = root_dir.path().join("missing/hidden");
+        let exception_dir = hidden_dir.join("kept");
+        // A platform that can't capture a path that doesn't exist yet refuses
+        // the policy at this point, before a sandbox is built.
+        let (Ok(hidden), Ok(exception)) = (
+            HostFilesystemLocation::capture(&hidden_dir),
+            HostFilesystemLocation::capture(&exception_dir),
+        ) else {
+            assert!(
+                !cfg!(target_os = "macos"),
+                "macOS must capture paths that don't exist yet"
+            );
+            return;
+        };
+        let Some(mut sandbox) = enforced_or_refused(Sandbox::new(SandboxPolicy {
+            fs: SandboxFsPolicy::Unrestricted {
+                protected_paths: Vec::new(),
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: vec![hidden],
+                paths_allowing_reads: vec![exception],
+            },
+            network: SandboxNetPolicy::Blocked,
+            allowed_unix_sockets: Vec::new(),
+        })) else {
+            return;
+        };
+
+        let ordinary_file = root_dir.path().join("missing/ordinary");
+        let output = run_shell(
+            &mut sandbox,
+            &format!(
+                "mkdir -p '{}' && echo hello > '{}'",
+                root_dir.path().join("missing").display(),
+                ordinary_file.display()
+            ),
+        );
+        assert!(
+            output.status.success(),
+            "unrestricted write: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run_shell(&mut sandbox, &format!("mkdir '{}'", hidden_dir.display()));
+        assert!(!output.status.success(), "created a hidden path");
+        assert!(!hidden_dir.exists());
+
+        std::fs::create_dir_all(&exception_dir).expect("create exception dir");
+        let exception_file = exception_dir.join("written");
+        let output = run_shell(
+            &mut sandbox,
+            &format!("echo hello > '{}'", exception_file.display()),
+        );
+        assert!(
+            output.status.success(),
+            "write inside an exception: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = run_shell(
+            &mut sandbox,
+            &format!("echo hello > '{}'", hidden_dir.join("other").display()),
+        );
+        assert!(!output.status.success(), "wrote inside a hidden path");
+    }
+
+    #[test]
+    fn paths_disallowing_reads_inside_allowing_are_rejected() {
+        let root_dir = tempfile::tempdir().expect("create root dir");
+        let outer = root_dir.path().join("outer");
+        let exception = outer.join("exception");
+        let inner = exception.join("inner");
+        std::fs::create_dir_all(&inner).expect("create nested dirs");
+        let result = Sandbox::new(SandboxPolicy {
+            fs: SandboxFsPolicy::Unrestricted {
+                protected_paths: Vec::new(),
+                protected_file_names: Vec::new(),
+                paths_disallowing_reads: vec![location(&outer), location(&inner)],
+                paths_allowing_reads: vec![location(&exception)],
+            },
+            network: SandboxNetPolicy::Blocked,
+            allowed_unix_sockets: Vec::new(),
+        });
+        assert!(matches!(result, Err(SandboxError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn fs_merge_keeps_only_allowing_both_layers_leave_visible() {
+        let root_dir = tempfile::tempdir().expect("create root dir");
+        let data_dir = root_dir.path().join("data");
+        let kept_dir = data_dir.join("kept");
+        let nested_dir = kept_dir.join("nested");
+        let other_dir = root_dir.path().join("other");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        std::fs::create_dir_all(&other_dir).expect("create other dir");
+        let hiding = |hidden: &[&Path], exceptions: &[&Path]| SandboxFsPolicy::Unrestricted {
+            protected_paths: Vec::new(),
+            protected_file_names: Vec::new(),
+            paths_disallowing_reads: hidden.iter().map(|path| location(path)).collect(),
+            paths_allowing_reads: exceptions.iter().map(|path| location(path)).collect(),
+        };
+
+        // A layer that hides `data` without an exception for `kept` drops it.
+        assert_eq!(
+            hiding(&[&data_dir], &[&kept_dir]).merge(hiding(&[&data_dir], &[])),
+            hiding(&[&data_dir], &[])
+        );
+        // A layer that hides something inside the exception drops it too.
+        assert_eq!(
+            hiding(&[&data_dir], &[&kept_dir]).merge(hiding(&[&nested_dir], &[])),
+            hiding(&[&data_dir], &[])
+        );
+        // Exceptions survive where the other layer hides nothing of theirs.
+        assert_eq!(
+            hiding(&[&data_dir], &[&kept_dir]).merge(hiding(&[&other_dir], &[])),
+            hiding(&[&data_dir, &other_dir], &[&kept_dir])
+        );
+        assert_eq!(
+            hiding(&[&data_dir], &[&kept_dir]).merge(hiding(&[&data_dir], &[&kept_dir])),
+            hiding(&[&data_dir], &[&kept_dir])
+        );
+    }
+
+    /// The sandbox for a policy that only some platforms can enforce, or
+    /// `None` where the platform refuses it.
+    ///
+    /// A platform must do one or the other: accepting such a policy without
+    /// enforcing it would run the command with access the caller withheld. A
+    /// test that gets a sandbox back goes on to check the enforcement, so the
+    /// same body holds a platform to whichever of the two it claims.
+    fn enforced_or_refused(result: Result<Sandbox, SandboxError>) -> Option<Sandbox> {
+        match result {
+            Ok(sandbox) => Some(sandbox),
+            Err(SandboxError::UnsupportedPolicy(message)) => {
+                assert!(
+                    !cfg!(target_os = "macos"),
+                    "macOS must enforce every policy: {message}"
+                );
+                None
+            }
+            Err(error) => panic!("expected a sandbox or an unsupported policy, got {error}"),
+        }
+    }
+
+    /// Whether this host can run commands under `policy`, which every platform
+    /// supports. A Linux host without a usable Bubblewrap cannot; the test
+    /// then skips, unless `ZED_TEST_SANDBOX_REQUIRE_ENFORCED` is set, which
+    /// makes that a failure.
+    fn host_can_run_sandbox(policy: &SandboxPolicy) -> bool {
+        match Sandbox::can_create(policy) {
+            Ok(()) => true,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("ZED_TEST_SANDBOX_REQUIRE_ENFORCED").is_none(),
+                    "this host cannot run the sandbox: {error}"
+                );
+                eprintln!("skipping: this host cannot run the sandbox: {error}");
+                false
+            }
+        }
+    }
+
+    fn location(path: &Path) -> HostFilesystemLocation {
+        HostFilesystemLocation::capture(path).expect("capture location")
+    }
+
+    fn run_shell(sandbox: &mut Sandbox, script: &str) -> Output {
+        run_sandboxed(sandbox, "/bin/sh", &["-c", script])
+    }
+
+    fn unrestricted_fs() -> SandboxFsPolicy {
+        SandboxFsPolicy::Unrestricted {
+            protected_paths: Vec::new(),
+            protected_file_names: Vec::new(),
+            paths_disallowing_reads: Vec::new(),
+            paths_allowing_reads: Vec::new(),
+        }
+    }
+
+    fn run_sandboxed(sandbox: &mut Sandbox, program: &str, args: &[&str]) -> Output {
+        let command = CommandAndArgs {
+            program: program.to_string(),
+            args: args.iter().map(|argument| argument.to_string()).collect(),
+            env: HashMap::new(),
+            cwd: None,
+        };
+        futures::executor::block_on(sandbox.execute(&command)).expect("run sandboxed command")
+    }
 }
 
 /// A directory that is about to be granted as a sandbox write path but may not
@@ -1508,6 +2295,9 @@ mod tests {
 /// (`HostFilesystemLocation`), which re-pins the inode when the command runs.
 pub struct GrantableWriteDir {
     canonical_path: PathBuf,
+    /// The path exactly as requested, carried so the caller can persist and
+    /// display the `(raw, canonical)` pair (see [`HostFilesystemLocation`]).
+    untrusted_raw_path: PathBuf,
     /// Directories created eagerly to pin the inode, shallowest-first. Empty on
     /// platforms that defer creation to [`Self::finalize`].
     eagerly_created: Vec<PathBuf>,
@@ -1516,6 +2306,7 @@ pub struct GrantableWriteDir {
 impl GrantableWriteDir {
     /// Prepare `path` for use as a sandbox write grant. `path` must be absolute.
     pub fn prepare(path: &Path) -> std::io::Result<Self> {
+        let untrusted_raw_path = path.to_path_buf();
         #[cfg(target_os = "linux")]
         {
             let mut eagerly_created = Vec::new();
@@ -1529,6 +2320,7 @@ impl GrantableWriteDir {
             let canonical_path = pinned_canonical_path(path)?;
             Ok(Self {
                 canonical_path,
+                untrusted_raw_path,
                 eagerly_created,
             })
         }
@@ -1536,12 +2328,13 @@ impl GrantableWriteDir {
         {
             Ok(Self {
                 canonical_path: canonicalize_allowing_missing_leaf(path),
+                untrusted_raw_path,
                 eagerly_created: Vec::new(),
             })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = path;
+            let _ = untrusted_raw_path;
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "granting a not-yet-existing write directory is not supported on this platform",
@@ -1553,6 +2346,12 @@ impl GrantableWriteDir {
     /// grant.
     pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
+    }
+
+    /// The path exactly as requested, for persisting alongside the canonical
+    /// path and for the "requested → granted" approval disclosure.
+    pub fn untrusted_raw_path(&self) -> &Path {
+        &self.untrusted_raw_path
     }
 
     /// Materialize the directory once the grant is approved. A no-op on platforms
@@ -1598,13 +2397,7 @@ fn create_missing_dirs(path: &Path, created: &mut Vec<PathBuf>) -> std::io::Resu
 /// when a component is a symlink.
 #[cfg(target_os = "linux")]
 fn pinned_canonical_path(path: &Path) -> std::io::Result<PathBuf> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let handle = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)?;
-    std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+    Ok(CanonicalPathBuf::resolve(path)?.into_path())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1662,65 +2455,5 @@ mod grantable_write_dir_tests {
 
         prepared.discard();
         assert!(!real.join("child").exists());
-    }
-}
-
-/// Canonicalize `path`, resolving symlinks, even when its final component
-/// doesn't exist yet.
-///
-/// `std::fs::canonicalize` fails if any component is missing, which would leave
-/// a not-yet-created path in a non-canonical form. The sandbox layers
-/// canonicalize the writable parent
-/// (the worktree root) but, with a plain `canonicalize`, fall back to the raw
-/// path for a missing child; the two then disagree when a component is a
-/// symlink (`/tmp` -> `/private/tmp` on macOS), and the protection rule for the
-/// child misses the real path the command ends up writing. Canonicalizing the
-/// existing parent and re-appending the final component keeps the child
-/// consistent with its parent. If neither the path nor its parent can be
-/// canonicalized, the path is returned unchanged.
-//
-// Only the macOS Seatbelt layer uses this (Linux skips not-yet-existing
-// protected paths rather than emitting a rule for them), so it's gated to macOS
-// to avoid a dead-code warning elsewhere.
-#[cfg(target_os = "macos")]
-pub(crate) fn canonicalize_allowing_missing_leaf(path: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
-    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
-        && let Ok(canonical_parent) = parent.canonicalize()
-    {
-        return canonical_parent.join(file_name);
-    }
-    path.to_path_buf()
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod macos_tests {
-    use super::canonicalize_allowing_missing_leaf;
-
-    #[test]
-    fn canonicalize_allowing_missing_leaf_resolves_existing_parent() {
-        let dir = tempfile::tempdir().unwrap();
-        let canonical_dir = dir.path().canonicalize().unwrap();
-
-        // A fully existing path is canonicalized outright.
-        assert_eq!(
-            canonicalize_allowing_missing_leaf(dir.path()),
-            canonical_dir
-        );
-
-        // A path whose leaf doesn't exist yet still resolves through its parent,
-        // so it stays consistent with how the parent directory canonicalizes
-        // (for example, when protecting a not-yet-created child path).
-        let missing = dir.path().join("not-created-yet");
-        assert_eq!(
-            canonicalize_allowing_missing_leaf(&missing),
-            canonical_dir.join("not-created-yet"),
-        );
-
-        // A path whose parent also doesn't exist is returned unchanged.
-        let deeper = missing.join(".git");
-        assert_eq!(canonicalize_allowing_missing_leaf(&deeper), deeper);
     }
 }

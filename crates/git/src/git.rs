@@ -61,12 +61,21 @@ actions!(
         Blame,
         /// Shows the git history for the selected file, folder, or project.
         FileHistory,
+        /// Opens a permalink for the selected file on its Git hosting provider.
+        OpenFilePermalink,
+        /// Copies a permalink for the selected file on its Git hosting provider.
+        CopyFilePermalink,
         /// Opens the selected file in the editor without a diff view.
         ViewFile,
         /// Stages the current file.
         StageFile,
         /// Unstages the current file.
         UnstageFile,
+        // per-section
+        /// Stages every entry in the section containing the selected entry.
+        StageSection,
+        /// Unstages every entry in the section containing the selected entry.
+        UnstageSection,
         // repo-wide
         /// Stages all changes in the repository.
         StageAll,
@@ -74,6 +83,10 @@ actions!(
         UnstageAll,
         /// Stashes all changes in the repository, including untracked files.
         StashAll,
+        /// Stashes tracked changes in the repository, leaving untracked files in place.
+        StashTracked,
+        /// Stashes staged changes in the repository, leaving unstaged changes in place.
+        StashStaged,
         /// Pops the most recent stash.
         StashPop,
         /// Apply the most recent stash.
@@ -104,8 +117,8 @@ actions!(
         FetchFrom,
         /// Creates a new commit with staged changes.
         Commit,
-        /// Creates a new commit with staged changes, skipping git hooks.
-        CommitNoVerify,
+        /// Runs the next commit with `git commit --no-verify`.
+        SkipHooks,
         /// Amends the last commit with staged changes.
         Amend,
         /// Enable the --signoff option.
@@ -117,6 +130,8 @@ actions!(
         /// Toggles whether the commit message editor fills all the available
         /// vertical space within the git panel.
         ToggleFillCommitEditor,
+        /// Toggles whether the commit message editor is shown in the git panel.
+        ToggleCommitEditor,
         /// Generates a commit message using AI.
         GenerateCommitMessage,
         /// Initializes a new git repository.
@@ -134,6 +149,8 @@ actions!(
         AddToGitInfoExclude,
         /// Copies the current branch name to the clipboard.
         CopyBranchName,
+        /// Creates a tag at HEAD.
+        CreateTagAtHead,
     ]
 );
 
@@ -147,6 +164,11 @@ pub struct RenameBranch {
     /// Default: the current branch.
     #[serde(default)]
     pub branch: Option<String>,
+}
+
+/// Trim. Then replace ` `  with `-`.
+pub fn normalize_branch_name(query: &str) -> String {
+    query.trim().replace(' ', "-")
 }
 
 /// Restores a file to its last committed state, discarding local changes.
@@ -229,7 +251,7 @@ impl Oid {
         &self.bytes[..self.format.byte_len()]
     }
 
-    pub(crate) fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         self.as_bytes().iter().all(|byte| *byte == 0)
     }
 
@@ -362,6 +384,13 @@ impl From<Oid> for usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_branch_name() {
+        assert_eq!(normalize_branch_name(" branch-name "), "branch-name");
+        assert_eq!(normalize_branch_name("branch name"), "branch-name");
+        assert_eq!(normalize_branch_name("  branch  name  "), "branch--name");
+    }
 
     #[test]
     fn parses_short_sha1_oid_by_padding_trailing_nibbles() {
